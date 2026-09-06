@@ -151,9 +151,10 @@ def scan(limit: int = 0) -> dict[str, int]:
     le dernier passage : sur 639 conversations, tout hacher à chaque tour coûterait
     plusieurs secondes pour aucune information nouvelle.
     """
-    stats = {"vus": 0, "nouveaux": 0, "modifies": 0, "inchanges": 0}
+    stats = {"vus": 0, "nouveaux": 0, "modifies": 0, "inchanges": 0, "reprises": 0}
     if not RAW_ROOT.is_dir():
         return stats
+    stats["reprises"] = reconcile_lost_analyses()
 
     conn = connect()
     try:
@@ -211,6 +212,52 @@ def scan(limit: int = 0) -> dict[str, int]:
     finally:
         conn.close()
     return stats
+
+
+MIRROR_ROOT = Path(os.environ.get("CONVIA_MIRROR_ROOT", "/srv/vault-mirror"))
+# Un depot accepte par le spool n est pas encore une note sur le Drive. Le pousseur
+# est fiable mais pas infaillible, et une intention peut finir en echec longtemps
+# apres. Au-dela de ce delai, une analyse annoncee ecrite mais introuvable dans le
+# miroir est consideree perdue et la conversation repart en file. Large a dessein :
+# Drive puis miroir prennent deja jusqu a 30 min, et un reindex en cours peut
+# retarder le pousseur de plusieurs heures.
+RECONCILE_AFTER_S = 24 * 3600
+
+
+def reconcile_lost_analyses() -> int:
+    """Remet en file les analyses marquees ecrites mais absentes du miroir.
+
+    Sans ce filet, un echec du spool laisserait une conversation `done` sans note :
+    silencieusement jamais analysee, et invisible dans le backlog.
+    """
+    conn = connect()
+    remises = 0
+    try:
+        limite = datetime.now(UTC).timestamp() - RECONCILE_AFTER_S
+        for row in conn.execute(
+            "SELECT event_id, analysis_path, analysed_at FROM pending_analysis"
+            " WHERE status = 'done' AND analysis_path IS NOT NULL"
+        ):
+            try:
+                ecrit_a = datetime.strptime(
+                    row["analysed_at"], "%Y-%m-%dT%H:%M:%SZ"
+                ).replace(tzinfo=UTC).timestamp()
+            except (TypeError, ValueError):
+                continue
+            if ecrit_a > limite:
+                continue
+            if (MIRROR_ROOT / row["analysis_path"]).is_file():
+                continue
+            conn.execute(
+                "UPDATE pending_analysis SET status = 'pending', analysed_at = NULL,"
+                " analysis_path = NULL WHERE event_id = ?",
+                (row["event_id"],),
+            )
+            remises += 1
+        conn.commit()
+    finally:
+        conn.close()
+    return remises
 
 
 def list_pending(limit: int = 10, sources: list[str] | None = None) -> list[PendingItem]:

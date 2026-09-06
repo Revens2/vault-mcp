@@ -186,3 +186,43 @@ def test_status_flags_a_frozen_corpus(env):
     etat = mcp.status()
     assert etat["capture_fraiche"] is False
     assert any("figé" in e for e in etat["active_errors"])
+
+
+def test_an_analysis_that_never_reached_the_mirror_returns_to_the_queue(env, tmp_path, monkeypatch):
+    """Un depot accepte par le spool n'est pas encore une note sur le Drive."""
+    mcp, queue, conv = env
+    path = "raw/assets/ConvIA/Claude-CLI/2026-09-01_deploiement-casse_9f8e7d6c.md"
+    digest = queue.sha256_of(conv)
+    prepared = mcp.prepare_analysis(path, digest, queue.ANALYSIS_VERSION, "# Analyse")
+    mcp.confirm_analysis(path, digest, str(prepared["path"]))
+    assert queue.status()["analysis_pending"] == 0
+
+    mirror = tmp_path / "mirror"
+    monkeypatch.setattr(queue, "MIRROR_ROOT", mirror)
+
+    # Encore frais : on laisse le pousseur travailler, aucune reprise.
+    assert queue.reconcile_lost_analyses() == 0
+    assert queue.status()["analysis_pending"] == 0
+
+    # Passe le delai, toujours rien dans le miroir : l'analyse est perdue.
+    monkeypatch.setattr(queue, "RECONCILE_AFTER_S", -1)
+    assert queue.reconcile_lost_analyses() == 1
+    assert queue.status()["analysis_pending"] == 1
+
+
+def test_an_analysis_present_in_the_mirror_stays_done(env, tmp_path, monkeypatch):
+    mcp, queue, conv = env
+    path = "raw/assets/ConvIA/Claude-CLI/2026-09-01_deploiement-casse_9f8e7d6c.md"
+    digest = queue.sha256_of(conv)
+    prepared = mcp.prepare_analysis(path, digest, queue.ANALYSIS_VERSION, "# Analyse")
+    mcp.confirm_analysis(path, digest, str(prepared["path"]))
+
+    mirror = tmp_path / "mirror"
+    cible = mirror / str(prepared["path"])
+    cible.parent.mkdir(parents=True)
+    cible.write_text("# Analyse", encoding="utf-8")
+    monkeypatch.setattr(queue, "MIRROR_ROOT", mirror)
+    monkeypatch.setattr(queue, "RECONCILE_AFTER_S", -1)
+
+    assert queue.reconcile_lost_analyses() == 0
+    assert queue.status()["analysis_pending"] == 0
