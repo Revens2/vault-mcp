@@ -32,6 +32,11 @@ MAX_ANALYSIS_CHARS = 60_000
 INGEST_UNIT = os.environ.get("WIKI_INGEST_UNIT", "llm-wiki-ingest.service")
 INGEST_STATE_DIR = Path(os.environ.get("WIKI_INGEST_STATE", "/var/lib/llm-wiki"))
 INGEST_BIN = os.environ.get("WIKI_INGEST_BIN", "/usr/local/bin/llm_wiki_ingest.sh")
+# Marqueur de DEMANDE d'ingestion, consommé par llm-wiki-ingest-request.path (root).
+# Voir `ingest_start` : le MCP ne peut pas escalader (NoNewPrivileges), il dépose.
+INGEST_REQUEST = Path(
+    os.environ.get("WIKI_INGEST_REQUEST", "/var/lib/vault-mcp/wiki-ingest.request")
+)
 
 # Correspondance dossier brut -> dossier d'analyse. Le modèle ne choisit jamais le
 # chemin de sortie : il est dérivé de la source, donc reproductible et non forgeable.
@@ -286,8 +291,19 @@ def _systemctl(*args: str, privileged: bool = False) -> tuple[int, str]:
 
 
 def _is_running() -> bool:
-    code, _ = _systemctl("is-active", "--quiet")
-    return code == 0
+    """`activating` compte comme « en cours », pas seulement `active`.
+
+    Piège mesuré le 2026-09-06 : `llm-wiki-ingest.service` est un `Type=oneshot`,
+    donc il reste en `activating (start)` pendant TOUT le run et ne passe jamais
+    par `active`. `systemctl is-active --quiet` sort alors en 3 : la garde de
+    concurrence rendait `requested` au lieu de `already_running` pendant qu'une
+    ingestion tournait réellement.
+    """
+    code, out = _systemctl("show", "--property=ActiveState")
+    if code != 0:
+        return False
+    etat = out.partition("=")[2].strip()
+    return etat in {"active", "activating", "reloading", "deactivating"}
 
 
 def ingest_status() -> dict[str, object]:
@@ -349,19 +365,39 @@ def ingest_start() -> dict[str, object]:
 
     L'ingestion dure des heures : bloquer la requête MCP pendant ce temps ferait
     expirer l'appelant et laisserait le run orphelin. Le suivi passe par
-    `wiki_ingest_status`. `Type=oneshot` + `RefuseManualStart` côté unité rendent
-    un second démarrage impossible ; on le vérifie quand même avant, pour rendre
-    `already_running` plutôt qu'une erreur systemd.
+    `wiki_ingest_status`. `Type=oneshot` côté unité rend un second démarrage
+    inutile ; on le vérifie quand même avant, pour rendre `already_running`
+    plutôt qu'une erreur systemd.
+
+    DEMANDE, PAS ESCALADE DE PRIVILÈGE
+    ----------------------------------
+    La version précédente appelait `sudo -n systemctl start --no-block`. Elle
+    n'a jamais pu fonctionner : `vault-mcp.service` porte `NoNewPrivileges=yes`,
+    qui interdit à sudo de devenir root, quelle que soit la règle sudoers.
+    Symptôme mesuré le 2026-09-06 : « sudo: The "no new privileges" flag is set ».
+
+    On ne retire pas `NoNewPrivileges` : c'est le durcissement du seul composant
+    joignable depuis internet. On dépose donc une DEMANDE — un fichier marqueur
+    dans un répertoire déjà inscriptible par le service — que `.path` unit
+    exécutée par root consomme pour démarrer le moteur. Même principe que le
+    spool d'écriture (adr/0020) : le MCP n'obtient jamais un privilège, il
+    formule une intention que quelqu'un d'autre applique.
     """
     if _is_running():
         return {"state": "already_running", "unit": INGEST_UNIT,
                 "message": "une ingestion est deja en cours"}
-    code, out = _systemctl("start", "--no-block", privileged=True)
-    if code != 0:
-        return {"state": "error", "unit": INGEST_UNIT, "message": out[:500]}
+    try:
+        INGEST_REQUEST.parent.mkdir(parents=True, exist_ok=True)
+        INGEST_REQUEST.write_text(
+            datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        return {"state": "error", "unit": INGEST_UNIT,
+                "message": f"demande non deposee : {type(exc).__name__}: {exc}"}
     return {
         "run_id": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
-        "state": "started",
+        "state": "requested",
         "unit": INGEST_UNIT,
-        "message": "ingestion demarree, suivre avec wiki_ingest_status()",
+        "message": "demande deposee ; le moteur demarre sous quelques secondes, "
+                   "suivre avec wiki_ingest_status()",
     }

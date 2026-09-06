@@ -226,3 +226,49 @@ def test_an_analysis_present_in_the_mirror_stays_done(env, tmp_path, monkeypatch
 
     assert queue.reconcile_lost_analyses() == 0
     assert queue.status()["analysis_pending"] == 0
+
+
+# ------------------------------------------------------- wiki_ingest_* (lot 2026-09-06)
+def test_un_oneshot_en_activating_compte_comme_en_cours(env, monkeypatch):
+    """`llm-wiki-ingest.service` est un Type=oneshot : il ne passe JAMAIS par
+    `active`, il reste `activating (start)` pendant tout le run. La garde de
+    concurrence rendait donc `requested` au lieu de `already_running` pendant
+    qu une ingestion tournait vraiment (constate le 2026-09-06)."""
+    mcp, _, _ = env
+    monkeypatch.setattr(mcp, "_systemctl", lambda *a, **k: (0, "ActiveState=activating"))
+    assert mcp._is_running() is True
+    assert mcp.ingest_start()["state"] == "already_running"
+
+
+def test_un_oneshot_inactive_ne_compte_pas_comme_en_cours(env, monkeypatch):
+    mcp, _, _ = env
+    monkeypatch.setattr(mcp, "_systemctl", lambda *a, **k: (0, "ActiveState=inactive"))
+    assert mcp._is_running() is False
+
+
+def test_ingest_start_depose_une_demande_et_n_escalade_jamais(env, tmp_path, monkeypatch):
+    """vault-mcp porte NoNewPrivileges=yes : aucun sudo ne peut aboutir. Le
+    demarrage passe donc par un marqueur consomme par root, jamais par une
+    escalade. Ce test echoue si quelqu un rebranche un sous-processus."""
+    mcp, _, _ = env
+    marqueur = tmp_path / "wiki-ingest.request"
+    monkeypatch.setattr(mcp, "INGEST_REQUEST", marqueur)
+    monkeypatch.setattr(mcp, "_systemctl", lambda *a, **k: (0, "ActiveState=inactive"))
+
+    def interdit(*a, **k):  # pragma: no cover - doit ne jamais etre appele
+        raise AssertionError("ingest_start ne doit lancer aucun sous-processus")
+
+    monkeypatch.setattr(mcp.subprocess, "run", interdit)
+
+    resultat = mcp.ingest_start()
+    assert resultat["state"] == "requested"
+    assert marqueur.is_file()
+    assert marqueur.read_text(encoding="utf-8").strip().endswith("Z")
+
+
+def test_ingest_start_signale_un_depot_impossible(env, tmp_path, monkeypatch):
+    mcp, _, _ = env
+    monkeypatch.setattr(mcp, "INGEST_REQUEST", tmp_path / "fichier" / "x" / "req")
+    monkeypatch.setattr(mcp, "_systemctl", lambda *a, **k: (0, "ActiveState=inactive"))
+    (tmp_path / "fichier").write_text("pas un dossier", encoding="utf-8")
+    assert mcp.ingest_start()["state"] == "error"
