@@ -160,3 +160,55 @@ def test_an_empty_document_does_not_explode() -> None:
     view, stats = convia_view.project_markdown("")
     assert stats["messages"] == 0
     assert view.strip() == "# Conversation"
+
+
+RUNTIME_NOISE = r"""---
+source: codex
+title: Audit perf
+convia_sanitized: 2
+---
+
+# Audit perf
+
+## 👤 User — 2026-08-22 19:00:00
+
+<recommended_plugins>
+- Airtable (airtable@openai-curated-remote)
+- Spotify (spotify@openai-curated-remote)
+</recommended_plugins>
+
+<INSTRUCTIONS>
+claude.md
+</INSTRUCTIONS>
+
+<environment_context>
+  <cwd>C:\Users\Juliann\Desktop\Watchy</cwd>
+  <shell>powershell</shell>
+</environment_context>
+
+<command-message>caveman</command-message>
+<command-name>/caveman</command-name>
+<command-args>fait un audit complet des performances</command-args>
+
+## 🤖 Assistant — 2026-08-22 19:00:10 · gpt-5
+
+Message Type: NEW_TASK
+Task name: /root/infra_obs_perf
+Sender: /root
+Payload:
+
+Je prends le volet infrastructure en lecture seule.
+"""
+
+
+def test_runtime_scaffolding_is_stripped_but_the_request_survives() -> None:
+    view, _ = convia_view.project_markdown(RUNTIME_NOISE)
+    # Ce que le runtime a injecte : dehors.
+    assert "openai-curated-remote" not in view
+    assert "powershell" not in view
+    assert "Message Type: NEW_TASK" not in view
+    assert "Sender: /root" not in view
+    assert "<command-args>" not in view
+    # Ce que la personne a reellement demande : intact.
+    assert "fait un audit complet des performances" in view
+    assert "Je prends le volet infrastructure en lecture seule." in view

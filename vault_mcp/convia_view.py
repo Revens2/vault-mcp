@@ -64,6 +64,25 @@ _FENCE = re.compile(r"^(`{3,})[^\n]*\n(.*?)\n\1\s*$", re.S)
 _TOOL_NAME = re.compile(r"🔧\s*(.+)")
 _REMINDER = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
 
+# Blocs d'enrobage injectés par le runtime dans le PREMIER message utilisateur. Ce
+# n'est pas la personne qui parle : c'est le catalogue des plugins disponibles, la
+# description du bac à sable, le rappel du fichier d'instructions. Sur un transcript
+# Codex réel, ces trois blocs pesaient 3,2 Ko sur 5,4 — 60 % d'une projection dont
+# l'analyste n'a aucun usage.
+_RUNTIME_BLOCKS = re.compile(
+    r"<(recommended_plugins|environment_context|INSTRUCTIONS|user_instructions|plugins"
+    r"|available_tools|command-message|command-name)>.*?</\1>",
+    re.S,
+)
+# `<command-args>` en revanche CONTIENT la demande réelle quand l'utilisateur passe
+# par une commande slash : on retire la balise, jamais son contenu.
+_COMMAND_ARGS = re.compile(r"</?command-args>")
+# Plomberie d'orchestration inter-agents, sans charge utile exploitable.
+_TASK_ENVELOPE = re.compile(
+    r"^Message Type: \w+\n(?:Task name: .*\n|Sender: .*\n|Payload:[ \t]*\n?)*",
+    re.M,
+)
+
 # Outils dont un succès n'apprend rien sur la difficulté rencontrée. Un ÉCHEC de ces
 # mêmes outils reste retenu : « le grep n'a rien trouvé » n'est pas du bruit quand il
 # explique le détour qui suit.
@@ -140,6 +159,9 @@ def _tool_of(summary: str) -> str:
 def _clean_prose(text: str) -> str:
     text = _THINKING.sub("", text)
     text = _REMINDER.sub("", text)
+    text = _RUNTIME_BLOCKS.sub("", text)
+    text = _TASK_ENVELOPE.sub("", text)
+    text = _COMMAND_ARGS.sub("", text)
     text = _DETAILS.sub("", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
