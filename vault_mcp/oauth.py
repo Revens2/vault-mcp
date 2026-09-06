@@ -24,6 +24,8 @@ empreinte, pas un oubli.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import hmac
 import json
@@ -118,21 +120,89 @@ def verifier_phrase(phrase: str, encode: str) -> bool:
     return hmac.compare_digest(empreinte.hex(), attendu_hex)
 
 
+class EtatOAuthCorrompu(RuntimeError):
+    """Etat OAuth persistant illisible (JSON invalide ou erreur d'E/S).
+
+    Fail-closed : on ne remplace JAMAIS silencieusement un etat illisible par un
+    dictionnaire vide (cela revoquerait de fait toutes les sessions et ecraserait
+    le bon etat au prochain write).
+    """
+
+
+@contextlib.contextmanager
+# noqa: C901 - verrou simple, pas de logique conditionnelle a extraire
+def _verrou(cible: Path):
+    """Verrou exclusif inter-processus (flock) autour d'un fichier d'etat.
+
+    Le verrou vit dans un fichier `<etat>.lock` a cote de la cible. flock est
+    porte par l'open file description : deux threads du meme processus (deux
+    `open()` distincts) se bloquent aussi, pas seulement deux processus.
+    """
+    cible.parent.mkdir(parents=True, exist_ok=True)
+    descripteur = open(cible.with_suffix(cible.suffix + ".lock"), "a+b")
+    try:
+        fcntl.flock(descripteur.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(descripteur.fileno(), fcntl.LOCK_UN)
+        finally:
+            descripteur.close()
+
+
 def _ecrire_atomique(cible: Path, donnees: Any) -> None:
-    """Ecrit puis renomme : un fichier d'etat a moitie ecrit rendrait tous les jetons
-    invalides d'un coup, sans qu'aucun message ne l'explique."""
+    """Ecrit un fichier temporaire, fsync, puis renomme (et fsync le repertoire).
+
+    A appeler SOUS `_verrou` (voir `_modifier`) : l'ecriture seule ne protege pas
+    contre deux read-modify-write concurrents. Un fichier d'etat a moitie ecrit
+    rendrait tous les jetons invalides d'un coup, sans qu'aucun message ne l'explique.
+    """
     cible.parent.mkdir(parents=True, exist_ok=True)
     tmp = cible.with_suffix(cible.suffix + ".tmp")
-    tmp.write_text(json.dumps(donnees, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.chmod(0o600)
+    brut = json.dumps(donnees, ensure_ascii=False, indent=2).encode("utf-8")
+    with open(tmp, "wb") as f:
+        f.write(brut)
+        f.flush()
+        os.fsync(f.fileno())
+    os.chmod(tmp, 0o600)
     tmp.replace(cible)
+    # Persiste le rename lui-meme (le nom de fichier vit dans le repertoire).
+    try:
+        descripteur = os.open(cible.parent, os.O_RDONLY)
+        try:
+            os.fsync(descripteur)
+        finally:
+            os.close(descripteur)
+    except OSError:  # certains systemes ne permettent pas fsync sur un repertoire
+        pass
+
+
+def _modifier(cible: Path, defaut: Any, modification) -> Any:
+    """Read-modify-write sous verrou exclusif, fail-closed sur lecture impossible.
+
+    `modification(donnees)` mute `donnees` sur place et peut retourner une valeur
+    (retournee a l'appelant).
+    """
+    with _verrou(cible):
+        donnees = _lire(cible, defaut)
+        resultat = modification(donnees)
+        _ecrire_atomique(cible, donnees)
+        return resultat
 
 
 def _lire(cible: Path, defaut: Any) -> Any:
+    """Lecture fail-closed : ENOENT -> defaut ; JSON invalide ou autre OSError ->
+    EtatOAuthCorrompu (jamais un defaut silencieux qui permettrait un ecrasement)."""
     try:
-        return json.loads(cible.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        brut = cible.read_bytes()
+    except FileNotFoundError:
         return defaut
+    except OSError as exc:
+        raise EtatOAuthCorrompu(f"etat OAuth illisible ({cible}): {exc.__class__.__name__}") from exc
+    try:
+        return json.loads(brut)
+    except json.JSONDecodeError as exc:
+        raise EtatOAuthCorrompu(f"etat OAuth JSON invalide ({cible})") from exc
 
 
 class MagasinOAuth:
@@ -165,22 +235,23 @@ class MagasinOAuth:
         return None
 
     def enregistrer_client(self, client: OAuthClientInformationFull) -> None:
-        donnees = _lire(self._fichier_clients, {"clients": []})
-        clients = [c for c in donnees.get("clients", []) if c["client_id"] != client.client_id]
-        clients.append(
-            {
-                "client_id": client.client_id,
-                "client_secret": client.client_secret,
-                "redirect_uris": [str(u) for u in (client.redirect_uris or [])],
-                "grant_types": list(client.grant_types),
-                "response_types": list(client.response_types),
-                "token_endpoint_auth_method": client.token_endpoint_auth_method,
-                "scope": client.scope,
-                "cree_le": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            }
-        )
-        donnees["clients"] = clients
-        _ecrire_atomique(self._fichier_clients, donnees)
+        def _ajouter(donnees: dict[str, Any]) -> None:
+            clients = [c for c in donnees.get("clients", []) if c["client_id"] != client.client_id]
+            clients.append(
+                {
+                    "client_id": client.client_id,
+                    "client_secret": client.client_secret,
+                    "redirect_uris": [str(u) for u in (client.redirect_uris or [])],
+                    "grant_types": list(client.grant_types),
+                    "response_types": list(client.response_types),
+                    "token_endpoint_auth_method": client.token_endpoint_auth_method,
+                    "scope": client.scope,
+                    "cree_le": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                }
+            )
+            donnees["clients"] = clients
+
+        _modifier(self._fichier_clients, {"clients": []}, _ajouter)
 
     # --- etat ------------------------------------------------------------------------
     def _etat(self) -> dict[str, dict[str, Any]]:
@@ -189,8 +260,17 @@ class MagasinOAuth:
             etat.setdefault(cle, {})
         return etat
 
-    def _ecrire_etat(self, etat: dict[str, dict[str, Any]]) -> None:
-        _ecrire_atomique(self._fichier_etat, self._purger(etat))
+    def _modifier_etat(self, modification) -> Any:
+        """Read-modify-write de l'etat.json sous verrou, purge des expires incluse."""
+
+        def _corps(etat: dict[str, dict[str, Any]]) -> Any:
+            for cle in ("demandes", "codes", "acces", "rafraichissements"):
+                etat.setdefault(cle, {})
+            resultat = modification(etat)
+            self._purger(etat)
+            return resultat
+
+        return _modifier(self._fichier_etat, {}, _corps)
 
     @staticmethod
     def _purger(etat: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -205,38 +285,40 @@ class MagasinOAuth:
 
     def poser_demande(self, donnees: dict[str, Any]) -> str:
         identifiant = secrets.token_urlsafe(24)
-        etat = self._etat()
-        etat["demandes"][identifiant] = {**donnees, "expire_a": int(time.time()) + DUREE_DEMANDE_S}
-        self._ecrire_etat(etat)
+
+        def _poser(etat: dict[str, dict[str, Any]]) -> None:
+            etat["demandes"][identifiant] = {**donnees, "expire_a": int(time.time()) + DUREE_DEMANDE_S}
+
+        self._modifier_etat(_poser)
         return identifiant
 
     def prendre_demande(self, identifiant: str) -> dict[str, Any] | None:
         """Lit **et retire** la demande : un consentement ne se rejoue pas."""
-        etat = self._etat()
-        demande = etat["demandes"].pop(identifiant, None)
+        demande = self._modifier_etat(
+            lambda etat: etat["demandes"].pop(identifiant, None)
+        )
         if demande is None:
             return None
-        self._ecrire_etat(etat)
         return demande if demande.get("expire_a", 0) > int(time.time()) else None
 
     def poser_code(self, code: str, donnees: dict[str, Any]) -> None:
-        etat = self._etat()
-        etat["codes"][code] = {**donnees, "expire_a": int(time.time()) + DUREE_CODE_S}
-        self._ecrire_etat(etat)
+        def _poser(etat: dict[str, dict[str, Any]]) -> None:
+            etat["codes"][code] = {**donnees, "expire_a": int(time.time()) + DUREE_CODE_S}
+
+        self._modifier_etat(_poser)
 
     def lire_code(self, code: str) -> dict[str, Any] | None:
         return self._etat()["codes"].get(code)
 
     def retirer_code(self, code: str) -> None:
-        etat = self._etat()
-        etat["codes"].pop(code, None)
-        self._ecrire_etat(etat)
+        self._modifier_etat(lambda etat: etat["codes"].pop(code, None))
 
     def poser_jetons(self, acces: dict[str, Any], rafraichissement: dict[str, Any]) -> None:
-        etat = self._etat()
-        etat["acces"][acces["jeton"]] = acces
-        etat["rafraichissements"][rafraichissement["jeton"]] = rafraichissement
-        self._ecrire_etat(etat)
+        def _poser(etat: dict[str, dict[str, Any]]) -> None:
+            etat["acces"][acces["jeton"]] = acces
+            etat["rafraichissements"][rafraichissement["jeton"]] = rafraichissement
+
+        self._modifier_etat(_poser)
 
     def lire_acces(self, jeton: str) -> dict[str, Any] | None:
         donnees = self._etat()["acces"].get(jeton)
@@ -248,10 +330,11 @@ class MagasinOAuth:
         return self._etat()["rafraichissements"].get(jeton)
 
     def revoquer(self, jeton: str) -> None:
-        etat = self._etat()
-        etat["acces"].pop(jeton, None)
-        etat["rafraichissements"].pop(jeton, None)
-        self._ecrire_etat(etat)
+        def _revoquer(etat: dict[str, dict[str, Any]]) -> None:
+            etat["acces"].pop(jeton, None)
+            etat["rafraichissements"].pop(jeton, None)
+
+        self._modifier_etat(_revoquer)
 
 
 class FournisseurOAuth(

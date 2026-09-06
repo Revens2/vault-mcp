@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import base64
 import json
+import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -205,3 +207,21 @@ def test_statistiques(spool: Spool) -> None:
 
 def test_statistiques_sans_spool(tmp_path: Path) -> None:
     assert Spool(str(tmp_path / "absent")).statistiques() == {"disponible": False}
+
+
+def test_statistiques_separent_historique_et_sante_courante(spool: Spool) -> None:
+    """Un stock ancien de conflits ne doit pas ressembler a une panne active :
+    `echecs` reste le total, `echecs_recents`/`echec_recent_s` portent la sante."""
+    vieux = spool.failed / "aaaa11111111.json"
+    vieux.write_text("{}", encoding="utf-8")
+    ancien = time.time() - 10 * 24 * 3600  # 10 jours
+    os.utime(vieux, (ancien, ancien))
+
+    recent = spool.failed / "bbbb22222222.json"
+    recent.write_text("{}", encoding="utf-8")
+
+    stats = spool.statistiques()
+    assert stats["echecs"] == 2                 # total historique conserve
+    assert stats["echecs_recents"] == 1         # seul le receipt recent compte
+    assert stats["echec_recent_s"] is not None
+    assert stats["echec_recent_s"] < 60         # age du plus recent echec

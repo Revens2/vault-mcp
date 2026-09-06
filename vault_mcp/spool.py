@@ -154,7 +154,7 @@ class Spool:
                 # `vault-spool`, ne peut pas la lire. Le defaut ne se voit pas
                 # en test (umask 022 en session) : il n apparait que sous
                 # systemd. Constate le 2026-09-05 au test bout-en-bout.
-                os.fchmod(fichier.fileno(), 0o660)
+                os.fchmod(fichier.fileno(), 0o660)  # nosemgrep: insecure-file-permissions
             # `os.replace` et non `Path.replace` (PTH105) : c est la primitive
             # POSIX documentee comme atomique, et c est le point exact que le test
             # d atomicite monkeypatche pour simuler un disque plein.
@@ -200,7 +200,14 @@ class Spool:
         return {"etat": "inconnu"}
 
     def statistiques(self) -> dict[str, Any]:
-        """Profondeur de file, age du plus vieux depot, volume des echecs."""
+        """Profondeur de file, ages, volume des echecs.
+
+        `echecs` reste le TOTAL historique (compat). La sante COURANTE se lit
+        dans `echecs_recents` (fenetre 1 h — une panne active produit de
+        nouveaux receipts chaque cycle) et `echec_recent_s` (age du dernier
+        echec) : un stock ancien de conflits CAS ne doit pas ressembler a une
+        panne active.
+        """
         if not self.disponible:
             return {"disponible": False}
 
@@ -212,11 +219,23 @@ class Spool:
             except OSError:
                 plus_vieux_s = None
 
+        maintenant = time.time()
+        ages_echecs: list[float] = []
+        for p in self.failed.glob("*.json"):
+            try:
+                ages_echecs.append(maintenant - p.stat().st_mtime)
+            except OSError:
+                pass
+        echecs_recents = sum(1 for a in ages_echecs if a < 3600)
+        echec_recent_s = round(min(ages_echecs), 1) if ages_echecs else None
+
         return {
             "disponible": True,
             "en_attente": len(en_file),
             "plus_vieux_s": plus_vieux_s,
             "echecs": len(list(self.failed.glob("*.json"))),
+            "echecs_recents": echecs_recents,
+            "echec_recent_s": echec_recent_s,
             "appliquees": len(list(self.done.glob("*.json"))),
         }
 
