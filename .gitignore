@@ -1,0 +1,35 @@
+# Secrets et état d'exécution — jamais versionnés
+.env
+.env.*
+!.env.example
+mcp.env*
+oauth/
+oauth-clients.json*
+ngrok.yml
+.config/
+models/
+index/
+backups/
+data/
+*.log
+
+# Sauvegardes / anciennes versions
+*.bak
+*.bak.*
+*~
+*.orig
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Éditeurs / OS
+*.swp
+.DS_Store
+Thumbs.db

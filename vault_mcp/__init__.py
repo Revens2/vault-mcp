@@ -1,0 +1,3 @@
+"""Serveur MCP unifie du vault Obsidian."""
+
+__version__ = "2.0.0"

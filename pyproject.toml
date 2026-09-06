@@ -1,0 +1,44 @@
+[project]
+name = "vault-mcp"
+version = "2.0.0"
+description = "Serveur MCP unifie du vault Obsidian : lecture, recherche semantique, graphe."
+requires-python = ">=3.12"
+
+[tool.setuptools.packages.find]
+include = ["vault_mcp*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = ["venv", "server_http.py", "server_http.py.v1"]
+
+[tool.ruff.lint]
+select = [
+  "E", "F", "W",   # pycodestyle + pyflakes
+  "I",             # isort
+  "B",             # bugbear
+  "S",             # bandit -- ce service est expose a internet
+  "A",             # shadowing de builtins
+  "C4", "UP", "SIM", "PTH", "RET", "ARG", "TRY", "N",
+]
+ignore = ["TRY003"]
+
+[tool.ruff.lint.per-file-ignores]
+# S101  : assert est le point de pytest.
+# ARG00x: la signature de httpx.MockTransport impose un parametre `request` que la
+#         plupart des gestionnaires de test n ont aucune raison de lire.
+# S105/6: les faux identifiants des tests sont la pour verifier qu ils NE fuient PAS.
+"tests/*" = ["S101", "ARG001", "ARG002", "ARG005", "S105", "S106"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+disallow_any_explicit = false
+files = ["vault_mcp", "tests", "scripts"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers"
+pythonpath = ["."]

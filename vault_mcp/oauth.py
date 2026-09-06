@@ -1,0 +1,423 @@
+"""Serveur d'autorisation OAuth 2.1 du vault, colocalise avec la ressource protegee.
+
+La specification MCP 2025-11-25 fait du serveur MCP un *resource server*, et laisse
+l'*authorization server* libre d'etre une entite separee ou colocalisee. On le colocalise :
+un service a un seul utilisateur ne justifie pas un serveur d'autorisation de plus a
+exposer et maintenir.
+
+Ce que claude.ai impose, et qui dicte la forme de ce module :
+
+- **`authorization_code` + PKCE S256 uniquement.** Le `client_credentials` pur n'est pas
+  supporte : chaque connexion exige un consentement humain. La page de consentement n'est
+  donc pas un raffinement, c'est le flux.
+- **`redirect_uri` exacte** : `https://claude.ai/api/mcp/auth_callback`.
+- **`/token` recoit du `x-www-form-urlencoded`**, pas du JSON. Le SDK s'en charge via
+  `token_endpoint_auth_method="client_secret_post"`.
+- **401 obligatoire** avec `WWW-Authenticate: Bearer resource_metadata="..."` : un
+  en-tete sur une reponse 200 est ignore par le client.
+
+Secret client en clair : le SDK compare `client.client_secret` par `hmac.compare_digest`,
+il lui faut donc la valeur. Le registre passe en 0600 `juliann-app`, meme niveau de
+protection que `mcp.env`. C'est un renoncement assume par rapport au stockage par
+empreinte, pas un oubli.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import os
+import secrets
+import time
+from pathlib import Path
+from typing import Any
+
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    OAuthAuthorizationServerProvider,
+    RefreshToken,
+)
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+
+REPERTOIRE_DEFAUT = Path("/opt/vault-mcp/oauth")
+# Le registre vit DANS le repertoire OAuth : c est le seul, avec index/, que l unite
+# systemd laisse en ecriture (ProtectSystem=strict). Hors de la, l enregistrement
+# dynamique echoue en OSError 30 -- 500 cote client, sans indice utilisable.
+FICHIER_CLIENTS = Path("/opt/vault-mcp/oauth/clients.json")
+PORTEE = "mcp:lecture"
+# Portee d ECRITURE, distincte et jamais accordee par defaut (adr/0020).
+#
+# Pourquoi une portee separee plutot qu un elargissement de `PORTEE` : un jeton
+# d acces vit 3 600 s et un jeton de rafraichissement 30 jours. Elargir la portee
+# existante transformerait, a l instant du deploiement, tout jeton deja emis pour
+# la lecture en jeton d ecriture sur les 5 663 notes du vault -- sans nouveau
+# consentement humain. L elevation de privilege serait retroactive et silencieuse.
+# La page de consentement annonce d ailleurs litteralement un acces "en lecture".
+PORTEE_ECRITURE = "mcp:ecriture"
+PORTEES = [PORTEE, PORTEE_ECRITURE]
+# Client synthetique portant le jeton statique des clients CLI.
+CLIENT_STATIQUE = "vault-mcp-cli-statique"
+
+def portees_du_jeton_statique() -> list[str]:
+    """Portees accordees au Bearer statique des clients CLI.
+
+    Pilotees par `VAULT_MCP_TOKEN_SCOPES` (portees separees par des espaces),
+    defaut `mcp:lecture`. L ecriture n est PAS accordee par defaut : un client
+    CLI qui ecrit dans le vault doit etre un choix conscient, consigne dans
+    /srv/docs/reference/clients-mcp-vault.md. Une portee inconnue est ignoree
+    plutot que propagee -- une faute de frappe ne doit pas accorder un droit.
+    """
+    brut = os.environ.get("VAULT_MCP_TOKEN_SCOPES", PORTEE).split()
+    portees = [portee for portee in brut if portee in PORTEES]
+    return portees or [PORTEE]
+
+
+# Un code d'autorisation ne doit vivre que le temps d'un aller-retour de redirection.
+DUREE_CODE_S = 90
+DUREE_ACCES_S = 3600
+DUREE_RAFRAICHISSEMENT_S = 30 * 24 * 3600
+# Au-dela, une demande de consentement laissee ouverte est abandonnee.
+DUREE_DEMANDE_S = 600
+
+ITERATIONS_PBKDF2 = 600_000
+
+
+class ConsentementError(RuntimeError):
+    """Phrase de passe refusee, ou demande de consentement inconnue ou expiree."""
+
+
+def repertoire_oauth() -> Path:
+    return Path(os.environ.get("VAULT_MCP_OAUTH_DIR", str(REPERTOIRE_DEFAUT)))
+
+
+def fichier_clients() -> Path:
+    return Path(os.environ.get("VAULT_MCP_OAUTH_CLIENTS", str(FICHIER_CLIENTS)))
+
+
+def hacher_phrase(phrase: str, sel: bytes | None = None) -> str:
+    """Empreinte PBKDF2 d'une phrase de passe, au format `pbkdf2$iter$sel$empreinte`."""
+    sel = sel or secrets.token_bytes(16)
+    empreinte = hashlib.pbkdf2_hmac("sha256", phrase.encode(), sel, ITERATIONS_PBKDF2)
+    return f"pbkdf2:{ITERATIONS_PBKDF2}:{sel.hex()}:{empreinte.hex()}"
+
+
+def verifier_phrase(phrase: str, encode: str) -> bool:
+    """Compare en temps constant. Un `==` laisserait mesurer la phrase octet par octet."""
+    try:
+        algo, iterations, sel_hex, attendu_hex = encode.split(":")
+    except ValueError:
+        return False
+    if algo != "pbkdf2":
+        return False
+    empreinte = hashlib.pbkdf2_hmac(
+        "sha256", phrase.encode(), bytes.fromhex(sel_hex), int(iterations)
+    )
+    return hmac.compare_digest(empreinte.hex(), attendu_hex)
+
+
+def _ecrire_atomique(cible: Path, donnees: Any) -> None:
+    """Ecrit puis renomme : un fichier d'etat a moitie ecrit rendrait tous les jetons
+    invalides d'un coup, sans qu'aucun message ne l'explique."""
+    cible.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cible.with_suffix(cible.suffix + ".tmp")
+    tmp.write_text(json.dumps(donnees, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.chmod(0o600)
+    tmp.replace(cible)
+
+
+def _lire(cible: Path, defaut: Any) -> Any:
+    try:
+        return json.loads(cible.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return defaut
+
+
+class MagasinOAuth:
+    """Etat persistant : demandes de consentement, codes, jetons.
+
+    Sur disque plutot qu'en memoire : sans cela, un redemarrage du service invaliderait
+    toutes les sessions en cours, et le client n'aurait aucun moyen de comprendre pourquoi.
+    """
+
+    def __init__(self, repertoire: Path | None = None, clients: Path | None = None) -> None:
+        self._repertoire = repertoire or repertoire_oauth()
+        self._fichier_clients = clients or fichier_clients()
+        self._fichier_etat = self._repertoire / "etat.json"
+
+    # --- clients ---------------------------------------------------------------------
+    def client(self, client_id: str) -> OAuthClientInformationFull | None:
+        for brut in _lire(self._fichier_clients, {}).get("clients", []):
+            if brut.get("client_id") != client_id:
+                continue
+            return OAuthClientInformationFull(
+                client_id=brut["client_id"],
+                client_secret=brut.get("client_secret"),
+                redirect_uris=brut.get("redirect_uris") or [],
+                grant_types=brut.get("grant_types") or ["authorization_code", "refresh_token"],
+                response_types=brut.get("response_types") or ["code"],
+                token_endpoint_auth_method=brut.get("token_endpoint_auth_method")
+                or "client_secret_post",
+                scope=brut.get("scope") or PORTEE,
+            )
+        return None
+
+    def enregistrer_client(self, client: OAuthClientInformationFull) -> None:
+        donnees = _lire(self._fichier_clients, {"clients": []})
+        clients = [c for c in donnees.get("clients", []) if c["client_id"] != client.client_id]
+        clients.append(
+            {
+                "client_id": client.client_id,
+                "client_secret": client.client_secret,
+                "redirect_uris": [str(u) for u in (client.redirect_uris or [])],
+                "grant_types": list(client.grant_types),
+                "response_types": list(client.response_types),
+                "token_endpoint_auth_method": client.token_endpoint_auth_method,
+                "scope": client.scope,
+                "cree_le": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+        )
+        donnees["clients"] = clients
+        _ecrire_atomique(self._fichier_clients, donnees)
+
+    # --- etat ------------------------------------------------------------------------
+    def _etat(self) -> dict[str, dict[str, Any]]:
+        etat: dict[str, dict[str, Any]] = _lire(self._fichier_etat, {})
+        for cle in ("demandes", "codes", "acces", "rafraichissements"):
+            etat.setdefault(cle, {})
+        return etat
+
+    def _ecrire_etat(self, etat: dict[str, dict[str, Any]]) -> None:
+        _ecrire_atomique(self._fichier_etat, self._purger(etat))
+
+    @staticmethod
+    def _purger(etat: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        """Retire ce qui a expire. Sans purge, le fichier grossit indefiniment et un code
+        perime resterait echangeable si la verification d'expiration venait a manquer."""
+        maintenant = int(time.time())
+        for cle in ("demandes", "codes", "acces", "rafraichissements"):
+            etat[cle] = {
+                k: v for k, v in etat.get(cle, {}).items() if v.get("expire_a", 0) > maintenant
+            }
+        return etat
+
+    def poser_demande(self, donnees: dict[str, Any]) -> str:
+        identifiant = secrets.token_urlsafe(24)
+        etat = self._etat()
+        etat["demandes"][identifiant] = {**donnees, "expire_a": int(time.time()) + DUREE_DEMANDE_S}
+        self._ecrire_etat(etat)
+        return identifiant
+
+    def prendre_demande(self, identifiant: str) -> dict[str, Any] | None:
+        """Lit **et retire** la demande : un consentement ne se rejoue pas."""
+        etat = self._etat()
+        demande = etat["demandes"].pop(identifiant, None)
+        if demande is None:
+            return None
+        self._ecrire_etat(etat)
+        return demande if demande.get("expire_a", 0) > int(time.time()) else None
+
+    def poser_code(self, code: str, donnees: dict[str, Any]) -> None:
+        etat = self._etat()
+        etat["codes"][code] = {**donnees, "expire_a": int(time.time()) + DUREE_CODE_S}
+        self._ecrire_etat(etat)
+
+    def lire_code(self, code: str) -> dict[str, Any] | None:
+        return self._etat()["codes"].get(code)
+
+    def retirer_code(self, code: str) -> None:
+        etat = self._etat()
+        etat["codes"].pop(code, None)
+        self._ecrire_etat(etat)
+
+    def poser_jetons(self, acces: dict[str, Any], rafraichissement: dict[str, Any]) -> None:
+        etat = self._etat()
+        etat["acces"][acces["jeton"]] = acces
+        etat["rafraichissements"][rafraichissement["jeton"]] = rafraichissement
+        self._ecrire_etat(etat)
+
+    def lire_acces(self, jeton: str) -> dict[str, Any] | None:
+        donnees = self._etat()["acces"].get(jeton)
+        if donnees and donnees.get("expire_a", 0) <= int(time.time()):
+            return None
+        return donnees
+
+    def lire_rafraichissement(self, jeton: str) -> dict[str, Any] | None:
+        return self._etat()["rafraichissements"].get(jeton)
+
+    def revoquer(self, jeton: str) -> None:
+        etat = self._etat()
+        etat["acces"].pop(jeton, None)
+        etat["rafraichissements"].pop(jeton, None)
+        self._ecrire_etat(etat)
+
+
+class FournisseurOAuth(
+    OAuthAuthorizationServerProvider[AuthorizationCode, RefreshToken, AccessToken]
+):
+    """Implemente le contrat du SDK. Le consentement est delegue a une page servie par
+    le serveur lui-meme, d'ou la redirection renvoyee par `authorize`."""
+
+    def __init__(
+        self,
+        emetteur: str,
+        magasin: MagasinOAuth | None = None,
+        jeton_statique: str = "",
+    ) -> None:
+        self._emetteur = emetteur.rstrip("/")
+        self._magasin = magasin or MagasinOAuth()
+        # Jeton Bearer historique des clients CLI. Presente au SDK comme un jeton d acces
+        # valide plutot que maintenu par un second systeme d authentification.
+        self._jeton_statique = jeton_statique
+
+    @property
+    def magasin(self) -> MagasinOAuth:
+        return self._magasin
+
+    async def get_client(self, client_id: str) -> OAuthClientInformationFull | None:
+        return self._magasin.client(client_id)
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        self._magasin.enregistrer_client(client_info)
+
+    async def authorize(
+        self, client: OAuthClientInformationFull, params: AuthorizationParams
+    ) -> str:
+        # On ne delivre pas de code ici : on renvoie vers la page de consentement, qui
+        # authentifie l humain avant d en creer un. Auto-approuver reviendrait a ce que
+        # quiconque connait le client_id obtienne un jeton.
+        demandees = list(params.scopes) if params.scopes else [PORTEE]
+        if PORTEE_ECRITURE not in demandees:
+            # Le consentement est celui de l'HUMAIN, pas du client : le vault a un
+            # seul proprietaire et seule la phrase de passe ouvre la porte. Les
+            # connecteurs (claude.ai, ChatGPT) ne demandent que la lecture par
+            # defaut -- meme quand la ressource annonce l'ecriture, ils rejouent
+            # leur portee d'enregistrement. On soumet donc TOUJOURS
+            # lecture+ecriture a l'approbation explicite de la page, pour que
+            # l'ecriture soit possible sans exiger une reconfiguration du
+            # connecteur. Jamais silencieux : la page affiche les deux droits et
+            # refuse sans la phrase de passe. Constat 2026-09-05 : re-consentement
+            # ChatGPT avec `mcp:lecture` seul malgre la metadata a deux portees.
+            demandees.append(PORTEE_ECRITURE)
+        identifiant = self._magasin.poser_demande(
+            {
+                "client_id": client.client_id,
+                "redirect_uri": str(params.redirect_uri),
+                "redirect_uri_fourni": params.redirect_uri_provided_explicitly,
+                "state": params.state,
+                "code_challenge": params.code_challenge,
+                "scopes": demandees,
+                "resource": params.resource,
+            }
+        )
+        return f"{self._emetteur}/consentement?demande={identifiant}"
+
+    def creer_code(self, demande: dict[str, Any]) -> str:
+        """Appelee par la page de consentement une fois la phrase de passe validee."""
+        code = secrets.token_urlsafe(32)
+        self._magasin.poser_code(code, demande)
+        return code
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> AuthorizationCode | None:
+        donnees = self._magasin.lire_code(authorization_code)
+        if donnees is None or donnees["client_id"] != client.client_id:
+            return None
+        return AuthorizationCode(
+            code=authorization_code,
+            scopes=donnees["scopes"],
+            expires_at=donnees["expire_a"],
+            client_id=donnees["client_id"],
+            code_challenge=donnees["code_challenge"],
+            redirect_uri=donnees["redirect_uri"],
+            redirect_uri_provided_explicitly=donnees["redirect_uri_fourni"],
+            resource=donnees.get("resource"),
+        )
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        # Un code ne s echange qu une fois : le retirer avant d emettre evite qu un rejeu
+        # produise un second jeton valide.
+        self._magasin.retirer_code(authorization_code.code)
+        # `client_id` est optionnel dans le modele du SDK ; ici il est garanti non nul,
+        # le client ayant ete authentifie avant l appel. mypy ne peut pas le deduire.
+        return self._emettre(
+            str(client.client_id), authorization_code.scopes, authorization_code.resource
+        )
+
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> RefreshToken | None:
+        donnees = self._magasin.lire_rafraichissement(refresh_token)
+        if donnees is None or donnees["client_id"] != client.client_id:
+            return None
+        return RefreshToken(
+            token=refresh_token,
+            client_id=donnees["client_id"],
+            scopes=donnees["scopes"],
+            expires_at=donnees.get("expire_a"),
+        )
+
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: list[str],
+    ) -> OAuthToken:
+        # Rotation : l ancien jeton de rafraichissement est revoque au moment de l echange.
+        self._magasin.revoquer(refresh_token.token)
+        return self._emettre(str(client.client_id), scopes or refresh_token.scopes, None)
+
+    async def load_access_token(self, token: str) -> AccessToken | None:
+        if self._jeton_statique and hmac.compare_digest(token, self._jeton_statique):
+            # Sans expiration : c est un jeton de service, tourne a la main.
+            return AccessToken(
+                token=token,
+                client_id=CLIENT_STATIQUE,
+                scopes=portees_du_jeton_statique(),
+                expires_at=None,
+            )
+        donnees = self._magasin.lire_acces(token)
+        if donnees is None:
+            return None
+        return AccessToken(
+            token=token,
+            client_id=donnees["client_id"],
+            scopes=donnees["scopes"],
+            expires_at=donnees["expire_a"],
+            resource=donnees.get("resource"),
+        )
+
+    async def revoke_token(self, token: AccessToken | RefreshToken) -> None:
+        self._magasin.revoquer(token.token)
+
+    def _emettre(self, client_id: str, scopes: list[str], resource: str | None) -> OAuthToken:
+        maintenant = int(time.time())
+        acces = secrets.token_urlsafe(32)
+        rafraichissement = secrets.token_urlsafe(32)
+        self._magasin.poser_jetons(
+            {
+                "jeton": acces,
+                "client_id": client_id,
+                "scopes": scopes,
+                "resource": resource,
+                "expire_a": maintenant + DUREE_ACCES_S,
+            },
+            {
+                "jeton": rafraichissement,
+                "client_id": client_id,
+                "scopes": scopes,
+                "expire_a": maintenant + DUREE_RAFRAICHISSEMENT_S,
+            },
+        )
+        return OAuthToken(
+            access_token=acces,
+            token_type="Bearer",  # noqa: S106 - type de jeton OAuth, pas un secret
+            expires_in=DUREE_ACCES_S,
+            scope=" ".join(scopes),
+            refresh_token=rafraichissement,
+        )

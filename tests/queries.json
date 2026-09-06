@@ -1,0 +1,25 @@
+{
+  "commentaire": "Jeu de reference fige le 2026-08-14, AVANT toute migration du RAG. Sert a comparer le nouveau moteur (fastembed + fragmentage + hybride) a l ancien (mcp-obsidian-semantic, 1 vecteur par note sur 4000 caracteres). Les requetes melangent volontairement quatre familles : formulation naturelle, identifiant exact, terme rare, et question dont la reponse est enfouie loin dans une note longue -- c est la ou l ancien moteur est structurellement aveugle.",
+  "requetes": [
+    { "id": 1, "famille": "naturelle", "texte": "comment ouvrir un port dans le pare-feu du VPS" },
+    { "id": 2, "famille": "naturelle", "texte": "configurer un reverse proxy nginx avec TLS" },
+    { "id": 3, "famille": "naturelle", "texte": "sauvegarder et restaurer un volume Docker" },
+    { "id": 4, "famille": "naturelle", "texte": "mettre en place un runner GitHub Actions self-hosted" },
+    { "id": 5, "famille": "naturelle", "texte": "filtrage DNS avec Pi-hole et resolveur chiffre" },
+    { "id": 6, "famille": "exact", "texte": "Tailscale exit node" },
+    { "id": 7, "famille": "exact", "texte": "unattended-upgrades" },
+    { "id": 8, "famille": "exact", "texte": "ProtectSystem=strict" },
+    { "id": 9, "famille": "exact", "texte": "rclone" },
+    { "id": 10, "famille": "exact", "texte": "fail2ban jail" },
+    { "id": 11, "famille": "rare", "texte": "Oracle Cloud security list ingress" },
+    { "id": 12, "famille": "rare", "texte": "MetaTrader 5 limitations techniques" },
+    { "id": 13, "famille": "rare", "texte": "Chorus Pro raccordement EDI facturation" },
+    { "id": 14, "famille": "rare", "texte": "quantification GGUF et offload VRAM" },
+    { "id": 15, "famille": "rare", "texte": "cocon semantique et maillage interne SEO" },
+    { "id": 16, "famille": "enfouie", "texte": "pourquoi les conteneurs deviennent injoignables apres une regle ip rule" },
+    { "id": 17, "famille": "enfouie", "texte": "difference entre systemctl is-active et ip link show" },
+    { "id": 18, "famille": "enfouie", "texte": "pourquoi ne pas mettre un resolveur DNS public a cote de Pi-hole" },
+    { "id": 19, "famille": "enfouie", "texte": "risque d un depot public branche sur un runner self-hosted" },
+    { "id": 20, "famille": "enfouie", "texte": "comment eviter qu un port Docker publie soit expose publiquement" }
+  ]
+}
