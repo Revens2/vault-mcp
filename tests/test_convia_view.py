@@ -9,7 +9,10 @@ from __future__ import annotations
 
 from vault_mcp import convia_view
 
-FAKE_TOKEN = "sk-proj-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"  # faux, jamais valide
+# Faux jeton volontairement basse entropie (lettre repetee) : le test de
+# redaction doit rester vert sans faire resonner les regles gitleaks
+# (generic-api-key / openai exigent une entropie elevee). Jamais valide.
+FAKE_TOKEN = "sk-proj-" + "A" * 40  # faux, jamais valide
 FAKE_PASSWORD = "password: hunter2-tres-secret"
 HUGE_STDOUT = "\n".join(f"ligne de sortie terminal numero {i:05d}" for i in range(2000))
 
