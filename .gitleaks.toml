@@ -1,0 +1,12 @@
+# Config gitleaks du depot vault-mcp.
+# L'historique (commit e92eb1cc, fichier supprime depuis) contient un jeton
+# FAUX dans une fixture de test : `FAKE_TOKEN = "..."` commente « faux, jamais
+# valide ». Ce n'est pas un secret, c'est la valeur factice d'un test unitaire
+# (test_convia_view.py, retire de l'arbre courant). On l'autorise par chemin,
+# sans elargir aux vrais fichiers de code.
+title = "vault-mcp gitleaks"
+[allowlist]
+  description = "fixtures de test volontairement factices (aucune valeur reelle)"
+  paths = [
+    '''tests/test_convia_view\.py''',
+  ]
