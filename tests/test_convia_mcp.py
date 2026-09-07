@@ -218,7 +218,7 @@ def test_secrets_are_redacted_in_the_written_analysis(env):
         path, digest, queue.ANALYSIS_VERSION,
         "# Analyse\n\nLa cle sk-proj-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA apparait.",
     )
-    assert "sk-proj-AbCdEf" not in prepared["content"]
+    assert "sk-proj-" not in prepared["content"]
     assert "<REDACTED_API_KEY>" in prepared["content"]
 
 
