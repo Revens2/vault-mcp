@@ -144,6 +144,26 @@ def _relative(path: Path) -> str:
         return str(path)
 
 
+def _is_conversation(path: Path) -> bool:
+    """Vrai pour `raw/assets/ConvIA/<source>/<fichier>.md`.
+
+    Un `.md` pose directement a la racine ConvIA n'est PAS une conversation :
+    l'interpreter comme un provider créerait une source fantome (agent = nom du
+    dossier racine, ex. « ConvIA » — incident canary E2E du 2026-09-07, file
+    d'analyse polluée). L'invariant minimal — le chemin relatif doit contenir au
+    moins `<source>/<fichier>` — suffit et reste extensible : n'importe quel
+    nouveau dossier source est accepté sans liste fermée de providers.
+    `_attachments/` (joints recopiés a cote des conversations) n'est pas non
+    plus une conversation.
+    """
+    if "_attachments" in path.parts:
+        return False
+    try:
+        return len(path.relative_to(RAW_ROOT).parts) >= 2
+    except ValueError:
+        return False
+
+
 def scan(limit: int = 0) -> dict[str, int]:
     """Réconcilie la file avec l'état du miroir. Idempotent.
 
@@ -151,7 +171,8 @@ def scan(limit: int = 0) -> dict[str, int]:
     le dernier passage : sur 639 conversations, tout hacher à chaque tour coûterait
     plusieurs secondes pour aucune information nouvelle.
     """
-    stats = {"vus": 0, "nouveaux": 0, "modifies": 0, "inchanges": 0, "reprises": 0}
+    stats = {"vus": 0, "nouveaux": 0, "modifies": 0, "inchanges": 0,
+             "reprises": 0, "mal_places": 0}
     if not RAW_ROOT.is_dir():
         return stats
     stats["reprises"] = reconcile_lost_analyses()
@@ -168,10 +189,12 @@ def scan(limit: int = 0) -> dict[str, int]:
         }
         seen_paths: set[str] = set()
         for path in sorted(RAW_ROOT.rglob("*.md")):
-            # `_attachments/` contient les fichiers joints recopies tels quels a cote des
-            # conversations. Ce ne sont pas des conversations : les mettre en file ferait
-            # analyser un rapport ou un bout de code comme s il etait un echange.
-            if "_attachments" in path.parts:
+            # Layout valide : <source>/<fichier>.md. Un .md a la racine ConvIA
+            # ou sous _attachments/ est ignore (jamais en file, jamais en
+            # source) ; les racines sont comptees pour observabilite.
+            if not _is_conversation(path):
+                if "_attachments" not in path.parts:
+                    stats["mal_places"] += 1
                 continue
             stats["vus"] += 1
             rel = _relative(path)
@@ -357,7 +380,7 @@ def status() -> dict[str, object]:
 def _corpus_count() -> int:
     if not RAW_ROOT.is_dir():
         return 0
-    return sum(1 for p in RAW_ROOT.rglob("*.md") if "_attachments" not in p.parts)
+    return sum(1 for p in RAW_ROOT.rglob("*.md") if _is_conversation(p))
 
 
 def _corpus_age_s() -> float | None:
@@ -365,6 +388,8 @@ def _corpus_age_s() -> float | None:
 
     Une capture Windows arrêtée laisse tous les timers en succès en tournant à vide —
     c'est arrivé du 16 au 22 août 2026. Seule la fraîcheur du produit le montre.
+    Seules les conversations `<source>/<fichier>.md` comptent : un .md pose a la
+    racine ConvIA (canary, artefact) ne doit ni gonfler le corpus ni le rajeunir.
     """
     if not RAW_ROOT.is_dir():
         return None
@@ -373,7 +398,7 @@ def _corpus_age_s() -> float | None:
     # mais date de 1970 -- exactement le cas qu on cherche a signaler.
     newest: float | None = None
     for path in RAW_ROOT.rglob("*.md"):
-        if "_attachments" in path.parts:
+        if not _is_conversation(path):
             continue
         try:
             mtime = path.stat().st_mtime

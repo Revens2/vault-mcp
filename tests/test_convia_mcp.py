@@ -63,6 +63,56 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return convia_mcp, convia_queue, conv
 
 
+# ---------------------------------------------------------------------------
+# Fichiers mal places a la racine ConvIA (mission 5, canary E2E du 2026-09-07)
+# ---------------------------------------------------------------------------
+def _scan_with(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+               files: dict[str, str]):
+    raw_root = tmp_path / "ConvIA"
+    for rel, content in files.items():
+        p = raw_root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+    monkeypatch.setenv("CONVIA_QUEUE_DB", str(tmp_path / "q.db"))
+    monkeypatch.setenv("CONVIA_RAW_ROOT", str(raw_root))
+    import importlib
+    from vault_mcp import convia_queue
+    importlib.reload(convia_queue)
+    stats = convia_queue.scan()
+    return convia_queue, raw_root, stats
+
+
+def test_md_a_la_racine_convia_ignore_pas_source(monkeypatch, tmp_path):
+    """`raw/assets/ConvIA/foo.md` (canary, artefact) : ignore, compte comme mal
+    place, JAMAIS une source ni un pending (source fantome « ConvIA »)."""
+    queue, _root, stats = _scan_with(tmp_path, monkeypatch, {
+        "CanaryE2E-m4-20260907T153010Z.md": "# canary inoffensif\n",
+        "claude-cli/2026-09-01_conversation.md": "contenu sans frontmatter\n",
+    })
+    assert stats["mal_places"] == 1
+    assert stats["vus"] == 1, "seule la conversation imbriquee est vue"
+    pending = queue.list_pending(limit=10)
+    agents = {item.source_agent for item in pending}
+    assert "ConvIA" not in agents
+    assert "ConvIA" not in queue.status()["pending_by_source"]
+    assert "claude-cli" in agents
+    assert queue._corpus_count() == 1, "le .md racine ne compte pas dans le corpus"
+
+
+def test_md_dans_un_dossier_source_accepte(monkeypatch, tmp_path):
+    """`ConvIA/<source>/<fichier>.md` reste accepte (source = dossier parent si
+    pas de frontmatter), sans liste fermee de providers."""
+    queue, _root, stats = _scan_with(tmp_path, monkeypatch, {
+        "claude-cli/2026-09-01_conversation.md": "contenu\n",
+        "une-nouvelle-source/2026-09-02_futur.md": "contenu\n",
+    })
+    assert stats["mal_places"] == 0
+    pending = queue.list_pending(limit=10)
+    agents = sorted({item.source_agent for item in pending})
+    assert "claude-cli" in agents
+    assert "une-nouvelle-source" in agents
+
+
 def test_pending_lists_the_conversation_with_projection_size(env):
     mcp, _queue, _conv = env
     out = mcp.list_pending(limit=5)
