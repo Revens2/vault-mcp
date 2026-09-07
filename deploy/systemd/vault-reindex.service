@@ -1,0 +1,56 @@
+[Unit]
+Description=Reindexation vectorielle du vault (vault-mcp)
+After=network-online.target vault-mirror-sync.service
+Wants=network-online.target
+OnFailure=notify-failure@%n.service
+
+[Service]
+Type=oneshot
+User=juliann-app
+Group=juliann-app
+WorkingDirectory=/opt/vault-mcp
+EnvironmentFile=/opt/vault-mcp/mcp.env
+Environment=PYTHONPATH=/opt/vault-mcp
+Environment=HOME=/opt/vault-mcp
+# ONNX Runtime prend tous les coeurs par defaut. Sur cette machine a 4 coeurs qui
+# heberge aussi la production Watchy, une reindexation non bridee monte la charge a
+# 4,0 et affame le reste -- constate le 2026-08-14, rclone en famine pendant la passe.
+Environment=OMP_NUM_THREADS=2
+Environment=VAULT_MCP_THREADS=3
+Environment=ORT_NUM_THREADS=2
+ExecStart=/opt/vault-mcp/venv/bin/python /opt/vault-mcp/scripts/reindex.py
+TimeoutStartSec=2h
+StandardInput=null
+Nice=15
+IOSchedulingClass=idle
+CPUWeight=20
+
+# Meme durcissement que le service principal : ce compte ne doit pas gagner de
+# droits parce qu il tourne en tache de fond.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+UMask=0077
+# Ecriture de l index, et lecture seule du miroir du vault.
+ReadWritePaths=/opt/vault-mcp/index
+ReadOnlyPaths=/srv/vault-mirror

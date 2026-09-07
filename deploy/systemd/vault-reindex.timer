@@ -1,0 +1,12 @@
+[Unit]
+Description=Rafraichissement de l index vectoriel du vault
+
+[Timer]
+# Une heure apres le miroir : laisser rclone finir avant de vectoriser.
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=20min
+Persistent=true
+Unit=vault-reindex.service
+
+[Install]
+WantedBy=timers.target
