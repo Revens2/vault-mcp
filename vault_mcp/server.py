@@ -1413,8 +1413,15 @@ def construire_application() -> Application:
 # memes une transaction interrompue. Le vault lui-meme n est jamais ecrit par ce
 # processus : il l est par le pousseur, depuis le spool.
 #
-# Le code de sortie est 0 : l arret est voulu, il ne doit pas declencher la
-# notification `OnFailure` de l unite.
+# Le chemin FORCE sort en 0. Un arret normal, lui, sort en 143 : uvicorn se
+# re-envoie le SIGTERM apres avoir ferme (mesure sur candidat : 143 sans outil
+# en vol, 0 avec sortie forcee). Les deux conviennent a systemd, qui sait qu il
+# a lui-meme envoye le TERM et ne declenche donc pas `OnFailure`.
+#
+# Contrepartie assumee : l appel d outil encore en vol est interrompu. Son
+# intention, si elle a deja ete deposee, survit (le depot est atomique) ; sa
+# reponse au client, elle, est perdue. C est le prix d un arret borne, et c est
+# preferable a un SIGKILL a 90 s qui coupe TOUT de la meme facon.
 ARRET_GRACIEUX_S = 5.0
 ARRET_MAXIMUM_S = 10.0
 
