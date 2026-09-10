@@ -1,6 +1,6 @@
 [project]
 name = "vault-mcp"
-version = "2.0.0"
+version = "2.1.0"
 description = "Serveur MCP unifie du vault Obsidian : lecture, recherche semantique, graphe."
 requires-python = ">=3.12"
 

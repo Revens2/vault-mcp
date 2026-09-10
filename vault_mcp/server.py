@@ -45,7 +45,7 @@ from vault_mcp.safety import (
     valider_dossier,
     valider_ecriture,
 )
-from vault_mcp import convia_mcp, convia_queue, dirty
+from vault_mcp import __version__, convia_mcp, convia_queue, dirty
 from vault_mcp.secrets import masquer
 from vault_mcp.spool import Spool, SpoolError
 from vault_mcp.store import StoreError
@@ -111,8 +111,11 @@ _fournisseur = FournisseurOAuth(EMETTEUR, jeton_statique=_token())
 # host/port/streamable_http_path/transport_security ont quitte le constructeur :
 # chemin + securite transport se passent a streamable_http_app() (construire_application).
 # auth_server_provider + auth (AuthSettings) : inchanges.
+# serverInfo.version : MCPServer (SDK 2.x) annonce "" par defaut ; on annonce la
+# version de livraison de vault-mcp (distincte de la version du SDK).
 mcp = MCPServer(
     "vault-couch",
+    version=__version__,
     auth_server_provider=_fournisseur,
     auth=AuthSettings(
         issuer_url=AnyHttpUrl(EMETTEUR),
@@ -1362,7 +1365,16 @@ def construire_application() -> Application:
 def main() -> None:
     # `mcp.run()` ne permet pas d'inserer un middleware : on construit l'application
     # nous-memes et on la sert directement.
-    uvicorn.run(construire_application(), host="127.0.0.1", port=PORT, log_level="info")
+    # Arret borne : sans limite, uvicorn attend la fin des flux SSE GET /mcp (jusqu a
+    # ~6 000 s observes) et systemd tue le service a TimeoutStopSec (90 s) -> chaque
+    # restart finissait en SIGKILL (7 fois en 14 jours, audit 2026-09-10).
+    uvicorn.run(
+        construire_application(),
+        host="127.0.0.1",
+        port=PORT,
+        log_level="info",
+        timeout_graceful_shutdown=5,
+    )
 
 
 if __name__ == "__main__":
