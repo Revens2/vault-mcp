@@ -99,6 +99,21 @@ def test_arret_borne_passe_a_uvicorn(serveur: Any, monkeypatch: pytest.MonkeyPat
     assert demarres, "le serveur doit etre demarre"
 
 
+def test_le_chien_de_garde_surveille_un_attribut_qui_existe() -> None:
+    """Garde-fou : `_sortie_bornee` boucle sur `uvicorn.Server.should_exit`.
+
+    Si une version d uvicorn renommait cet attribut, le chien de garde
+    attendrait indefiniment et l arret cesserait d etre borne SANS que rien
+    n echoue -- exactement la regression silencieuse qu on cherche a eviter.
+    Ce test la rend bruyante.
+    """
+    import uvicorn
+
+    serveur = uvicorn.Server(uvicorn.Config(app=None))
+    assert hasattr(serveur, "should_exit")
+    assert serveur.should_exit is False
+
+
 class _ThreadFactice:
     """Enregistre le chien de garde sans le lancer (il ne finirait jamais)."""
 
