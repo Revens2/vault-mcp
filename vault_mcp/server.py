@@ -46,6 +46,7 @@ from vault_mcp.safety import (
     valider_dossier,
     valider_ecriture,
 )
+from vault_mcp import convia_mcp, convia_queue
 from vault_mcp.secrets import masquer
 from vault_mcp.spool import Spool, SpoolError
 from vault_mcp.store import StoreError
@@ -1057,6 +1058,167 @@ def _age_index_s() -> float | None:
         return round(time.time() - fichier.stat().st_mtime, 1)
     except OSError:
         return None
+
+
+
+# ============================================================ ConvIA & LLM Wiki
+# Surface namespacee ajoutee le 2026-09-06. Aucun nouveau serveur MCP : ConvIA est
+# une fonction du Vault/RAG. Toute la logique vit dans vault_mcp.convia_mcp, qui est
+# testable sans monter le serveur ; ici on ne fait que decorer et traduire l erreur.
+
+
+@mcp.tool()
+def convia_status() -> dict[str, object]:
+    """Health of the whole ConvIA chain, in one call.
+
+    Answers "is ConvIA working?" without reading several logs: capture freshness,
+    per-source pending counts, oldest pending analysis, last analysis written, and
+    the live state of the LLM Wiki ingestion engine. Read-only.
+    """
+    try:
+        return convia_mcp.status()
+    except (convia_mcp.ConviaError, OSError) as exc:
+        return _erreur(f"ERREUR: {exc}")
+
+
+@mcp.tool()
+def convia_list_pending_analysis(
+    limit: int = 10, sources: list[str] | None = None
+) -> dict[str, object]:
+    """Conversations waiting for an analysis. Metadata only, never content.
+
+    `projection_bytes` is the size of the COMPACT view you would actually receive,
+    not of the raw transcript — size your batch on that. Oldest first. Filter with
+    `sources` (e.g. ["claude-cli", "codex"]). Read-only.
+    """
+    try:
+        return convia_mcp.list_pending(limit=limit, sources=sources)
+    except (convia_mcp.ConviaError, OSError) as exc:
+        return _erreur(f"ERREUR: {exc}")
+
+
+@mcp.tool()
+def convia_read_for_analysis(path: str, offset: int = 0, limit: int = 0) -> dict[str, object]:
+    """Compact view of one conversation, built for analysis. NOT the raw transcript.
+
+    Returns the user messages, the assistant's final answers, and only the technical
+    events that explain a difficulty (errors, stack traces, retries, resolutions).
+    Internal reasoning, system scaffolding, successful tool calls, huge outputs and
+    secrets are gone. Deterministic: same file in, same view out.
+
+    Use this and never `read_note` on a `raw/assets/ConvIA/**` path — the raw keeps
+    hundreds of tool calls on purpose, as historical evidence, and would drown the
+    analysis. Confined to the ConvIA namespace. Read-only.
+    """
+    try:
+        return convia_mcp.read_for_analysis(path, offset=offset, limit=limit)
+    except (convia_mcp.ConviaError, OSError) as exc:
+        return _erreur(f"ERREUR: {exc}")
+
+
+@mcp.tool()
+def convia_write_analysis(
+    source_path: str, source_hash: str, analysis_version: str, markdown: str
+) -> dict[str, object]:
+    """Write the analysis of one conversation into `raw/assets/ConvIA-Analysis/`.
+
+    You do NOT choose the destination path: it is derived from the source, so the
+    same conversation can never produce two notes. `source_hash` must be the
+    `source_sha256` returned by convia_read_for_analysis — a stale hash is refused
+    rather than producing an analysis of a version that no longer exists. An
+    identity already analysed (source_path, source_hash, analysis_version) is
+    refused too. Requires the `mcp:ecriture` scope.
+    """
+    refus = _exiger_ecriture()
+    if refus:
+        return _erreur(refus)
+    try:
+        prepared = convia_mcp.prepare_analysis(
+            source_path, source_hash, analysis_version, markdown
+        )
+    except (convia_mcp.ConviaError, OSError) as exc:
+        return _erreur(f"ERREUR: {exc}")
+
+    chemin = str(prepared["path"])
+    contenu = str(prepared["content"])
+    try:
+        note = valider_ecriture(chemin, contenu)
+    except CheminInvalideError as exc:
+        return _erreur(f"ERREUR: {exc}")
+
+    existe = _lire(note.relatif) is not None
+    try:
+        if existe:
+            # Une note deja presente mais absente de la file (base repartie de zero,
+            # analyse ecrite avant la mise en service) : on remplace plutot que
+            # d echouer, l identite logique reste la meme.
+            recu = _deposer("update", note.relatif, contenu=contenu)
+        else:
+            recu = _deposer("create", note.relatif, contenu=contenu)
+    except SpoolError as exc:
+        return _erreur(f"ERREUR: {exc}")
+
+    # La file n est marquee qu APRES un depot accepte. L inverse perdrait une
+    # conversation a chaque echec de spool.
+    convia_mcp.confirm_analysis(
+        str(prepared["source_path"]), str(prepared["source_hash"]), note.relatif
+    )
+    return {
+        "id": recu.get("id"),
+        "etat": recu.get("etat", "en_attente"),
+        "path": note.relatif,
+        "remplacee": existe,
+        "message": "analyse deposee ; interroger write_status(id) pour la confirmation",
+    }
+
+
+@mcp.tool()
+def convia_scan() -> dict[str, object]:
+    """Reconcile the pending queue with the mirror, now.
+
+    Normally driven by convia-queue.timer; call this when you have just synced and
+    do not want to wait for the next tick. Idempotent. Requires `mcp:ecriture`
+    because it writes the queue state.
+    """
+    refus = _exiger_ecriture()
+    if refus:
+        return _erreur(refus)
+    try:
+        return convia_queue.scan()
+    except OSError as exc:
+        return _erreur(f"ERREUR: {exc}")
+
+
+@mcp.tool()
+def wiki_ingest_status() -> dict[str, object]:
+    """State of the real LLM Wiki ingestion engine.
+
+    Reads what `llm_wiki_ingest.sh` already writes — manifest counters, quota
+    milestone, unit state. Nothing is reimplemented here. `quota_wait` with a
+    `resume_at` is the nominal branch, not a failure. Read-only.
+    """
+    etat = convia_mcp.ingest_status()
+    etat["backlog"] = convia_mcp.ingest_backlog()
+    return etat
+
+
+@mcp.tool()
+def wiki_ingest_start() -> dict[str, object]:
+    """Start the LLM Wiki ingestion and return immediately.
+
+    Processes the whole eligible raw backlog, not only ConvIA analyses: new PDFs,
+    notes and documents go through the same engine. Ingestion runs for hours, so
+    this never blocks — follow it with wiki_ingest_status(). Returns
+    `already_running` instead of starting a second worker. Requires `mcp:ecriture`.
+
+    Note: `raw/assets/ConvIA/**` is deliberately excluded from ingestion. Raw
+    transcripts stay searchable through the RAG but never become wiki pages.
+    """
+    refus = _exiger_ecriture()
+    if refus:
+        return _erreur(refus)
+    return convia_mcp.ingest_start()
+
 
 
 def construire_application() -> Application:
