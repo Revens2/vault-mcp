@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from vault_mcp import convia_queue, convia_view
+from vault_mcp import wiki_jobs as _wiki_jobs
 
 # Toute lecture ConvIA est confinée ici. Un chemin qui n'en descend pas est refusé
 # avant tout accès disque : le namespace est la frontière, pas une convention.
@@ -307,35 +308,30 @@ def _is_running() -> bool:
 
 
 def ingest_status() -> dict[str, object]:
-    """État du moteur réel, lu là où il l'écrit déjà.
+    """Etat de la file Wiki ChatGPT-seul. Aucun quota LLM externe.
 
-    Rien n'est réimplémenté ici : le manifeste, les jalons de reprise et les
-    compteurs appartiennent à `llm_wiki_ingest.sh`.
+    Lit la file persistante `wiki_jobs` (pending/chunks, leases, spool,
+    merges, quarantaines). Les champs historiques de l'ancien moteur Gemini
+    (`running`, `unit`, `quota_wait`, `resume_at`) sont conserves en
+    best-effort DEPRECATED pour ne pas casser les anciens clients, mais ils
+    ne gouvernent plus rien : `quota_wait` vaut toujours False.
     """
-    running = _is_running()
-    due = _read_state("ingest-due-at")
-    resume_at = None
-    quota_wait = False
-    if due and due.isdigit():
-        remaining = int(due) - int(time.time())
-        if remaining > 0:
-            quota_wait = True
-            resume_at = datetime.fromtimestamp(int(due), UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    code, out = _systemctl("show", "--property=ExecMainStartTimestamp",
-                           "--property=ExecMainStatus", "--property=Result")
-    props = dict(
-        line.split("=", 1) for line in out.splitlines() if "=" in line
-    ) if code == 0 else {}
-    return {
-        "running": running,
-        "unit": INGEST_UNIT,
-        "quota_wait": quota_wait,
-        "resume_at": resume_at,
-        "resume_count": _read_state("resume-count"),
-        "last_run": props.get("ExecMainStartTimestamp") or None,
-        "last_result": props.get("Result") or None,
-        "last_exit": props.get("ExecMainStatus") or None,
-    }
+    etat: dict[str, object] = {}
+    try:
+        etat.update(_wiki_jobs.status())
+    except OSError as exc:
+        etat["erreur_file"] = f"{type(exc).__name__}"
+    # Best-effort legacy (moteur Gemini retire) : ne jamais lever ici.
+    try:
+        running = _is_running()
+    except OSError:
+        running = False
+    etat.setdefault("running", running)
+    etat.setdefault("unit", INGEST_UNIT)
+    etat["quota_wait"] = False
+    etat["resume_at"] = None
+    etat["deprecated_legacy_worker"] = True
+    return etat
 
 
 def ingest_backlog() -> dict[str, object]:
@@ -361,43 +357,94 @@ def ingest_backlog() -> dict[str, object]:
 
 
 def ingest_start() -> dict[str, object]:
-    """Démarre le moteur et rend la main tout de suite.
+    """DEPRECATED : l'ancien worker LLM (Gemini/AGY) est retire.
 
-    L'ingestion dure des heures : bloquer la requête MCP pendant ce temps ferait
-    expirer l'appelant et laisserait le run orphelin. Le suivi passe par
-    `wiki_ingest_status`. `Type=oneshot` côté unité rend un second démarrage
-    inutile ; on le vérifie quand même avant, pour rendre `already_running`
-    plutôt qu'une erreur systemd.
-
-    DEMANDE, PAS ESCALADE DE PRIVILÈGE
-    ----------------------------------
-    La version précédente appelait `sudo -n systemctl start --no-block`. Elle
-    n'a jamais pu fonctionner : `vault-mcp.service` porte `NoNewPrivileges=yes`,
-    qui interdit à sudo de devenir root, quelle que soit la règle sudoers.
-    Symptôme mesuré le 2026-09-06 : « sudo: The "no new privileges" flag is set ».
-
-    On ne retire pas `NoNewPrivileges` : c'est le durcissement du seul composant
-    joignable depuis internet. On dépose donc une DEMANDE — un fichier marqueur
-    dans un répertoire déjà inscriptible par le service — que `.path` unit
-    exécutée par root consomme pour démarrer le moteur. Même principe que le
-    spool d'écriture (adr/0020) : le MCP n'obtient jamais un privilège, il
-    formule une intention que quelqu'un d'autre applique.
+    Rend toujours un refus explicite. La nouvelle ingestion passe par
+    `wiki_ingest_claim` -> `wiki_ingest_read` -> `wiki_ingest_submit` ->
+    `wiki_ingest_merge_pending`, draines par l'unique tache horaire ChatGPT.
+    Conserve pour ne pas casser les anciens clients ; jamais utilise par la
+    nouvelle tache.
     """
-    if _is_running():
-        return {"state": "already_running", "unit": INGEST_UNIT,
-                "message": "une ingestion est deja en cours"}
-    try:
-        INGEST_REQUEST.parent.mkdir(parents=True, exist_ok=True)
-        INGEST_REQUEST.write_text(
-            datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") + "\n", encoding="utf-8"
-        )
-    except OSError as exc:
-        return {"state": "error", "unit": INGEST_UNIT,
-                "message": f"demande non deposee : {type(exc).__name__}: {exc}"}
     return {
-        "run_id": datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ"),
-        "state": "requested",
+        "state": "deprecated",
+        "deprecated": True,
         "unit": INGEST_UNIT,
-        "message": "demande deposee ; le moteur demarre sous quelques secondes, "
-                   "suivre avec wiki_ingest_status()",
+        "message": "retire : l'ancien worker Gemini/AGY ne demarre plus. "
+                   "Utiliser wiki_ingest_claim/read/submit/merge_pending.",
     }
+
+
+# ------------------------------------------------- file Wiki ChatGPT-seul
+def _entier(valeur: object, defaut: int, nom: str) -> int:
+    """Entier MCP tolerant : une valeur non numerique est un refus explicite,
+    jamais une ValueError brute qui remonterait en erreur 500."""
+    if valeur is None or valeur == "":
+        return defaut
+    try:
+        return int(valeur)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ConviaError(f"parametre {nom} non numerique : {valeur!r}")
+
+
+def wiki_claim(limit: int = 10, max_bytes: int = 0,
+               lease_seconds: int = 3600) -> dict[str, object]:
+    """Reservation atomique de jobs Wiki. Delegue a `wiki_jobs.claim`."""
+    try:
+        return _wiki_jobs.claim(limit=_entier(limit, 10, "limit"),
+                                max_bytes=_entier(max_bytes, 0, "max_bytes"),
+                                lease_seconds=_entier(lease_seconds, 3600,
+                                                     "lease_seconds"))
+    except (OSError, _wiki_jobs.WikiJobsError) as exc:
+        raise ConviaError(str(exc))
+
+
+def wiki_read(job_id: str, lease_id: str) -> dict[str, object]:
+    """Lecture du seul snapshot/chunk reserve. Delegue a `wiki_jobs.read_job`."""
+    try:
+        return _wiki_jobs.read_job(job_id, lease_id)
+    except (OSError, _wiki_jobs.WikiJobsError) as exc:
+        raise ConviaError(str(exc))
+
+
+def wiki_submit(job_id: str, lease_id: str, fencing_token: int,
+                contract_version: str, extraction: dict) -> dict[str, object]:
+    """Soumission validee serveur + spool immediat. Idempotente."""
+    try:
+        return _wiki_jobs.submit(job_id, lease_id,
+                                 _entier(fencing_token, -1, "fencing_token"),
+                                 contract_version, extraction)
+    except (OSError, _wiki_jobs.WikiJobsError) as exc:
+        raise ConviaError(str(exc))
+
+
+def wiki_release(job_id: str, lease_id: str, action: str = "release",
+                 reason: str = "") -> dict[str, object]:
+    """Release volontaire / defer / renew borne."""
+    try:
+        return _wiki_jobs.release(job_id, lease_id, action, reason or "")
+    except (OSError, _wiki_jobs.WikiJobsError) as exc:
+        raise ConviaError(str(exc))
+
+
+def wiki_merge_pending(limit: int = 0, max_ms: int = 0) -> dict[str, object]:
+    """Drain deterministe du spool valide. Zero LLM."""
+    try:
+        return _wiki_jobs.merge_pending(limit=_entier(limit, 0, "limit"),
+                                        max_ms=_entier(max_ms, 0, "max_ms"))
+    except (OSError, _wiki_jobs.WikiJobsError) as exc:
+        raise ConviaError(str(exc))
+
+
+def wiki_sync(limit_files: int = 200) -> dict[str, object]:
+    """Decouverte + snapshot bornes des sources eligibles. Deterministe, sans LLM.
+
+    C'est ce qui remplit la file : sans sync, `claim` rend `jobs: []`. La
+    tache horaire l'appelle en tete de phase Wiki (borne : quelques centaines
+    de fichiers par run, quelques secondes). Idempotent et additif.
+    """
+    try:
+        n = _entier(limit_files, 200, "limit_files")
+        n = max(0, min(n, 2000))
+        return _wiki_jobs.sync_directory(limit_files=n)
+    except OSError as exc:
+        raise ConviaError(str(exc))
