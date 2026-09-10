@@ -26,6 +26,8 @@ Une erreur d'un job n'arrete jamais les autres.
 
 from __future__ import annotations
 
+import contextlib
+import copy
 import hashlib
 import json
 import os
@@ -36,6 +38,8 @@ import unicodedata
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
+
+from vault_mcp import wiki_contract as _contract
 
 CONTRACT_VERSION = "wiki-extract-v4"
 TOKENIZER = "local-cl100k-or-bytes4"
@@ -49,6 +53,13 @@ SPOOL_DIR = Path(os.environ.get("WIKI_JOBS_SPOOL", "/var/lib/llm-wiki/spool/extr
 MANIFEST_PATH = Path(os.environ.get(
     "WIKI_JOBS_MANIFEST", "/var/lib/llm-wiki/wiki_jobs_manifest.jsonl"))
 RAW_DIR = Path(os.environ.get("WIKI_RAW_DIR", "/srv/vault-mirror/raw"))
+# Wiki reel, ecrit par llm_wiki_merge (lecture seule ici) : sert a la garde
+# anti-collision de note.slug, cle d'ecriture des fiches wiki/sources/<slug>.md.
+WIKI_NOTES_DIR = Path(os.environ.get("WIKI_NOTES_DIR", "/srv/obsidian-vault/wiki"))
+# Le spool est lu par llm_wiki_merge (llmingest, groupe llmwiki) : fichiers et
+# repertoires lisibles par le groupe, quel que soit l'UMask du service.
+SPOOL_FILE_MODE = 0o660
+SPOOL_DIR_MODE = 0o2775
 # Dossiers exclus de l'eligibilite (meme semantique que INGEST_EXCLUDE_DIRS).
 EXCLUDE_DIRS = tuple(
     d for d in os.environ.get(
@@ -315,7 +326,12 @@ def sync_directory(limit_files: int = 0) -> dict[str, int]:
 # ------------------------------------------------------------------ claim
 def claim(limit: int = 10, max_bytes: int = 0,
           lease_seconds: int = DEFAULT_LEASE_S) -> dict[str, object]:
-    """Reservation atomique. Ne reserve jamais plus que le traitable immediat."""
+    """Reservation atomique. Ne reserve jamais plus que le traitable immediat.
+
+    Fail closed : sans contrat canonique chargeable, rien n'est reserve (un
+    job loue sans contrat ne peut qu'expirer).
+    """
+    digest = _contract_digest()
     limit = max(1, min(int(limit or 10), MAX_CLAIM_LIMIT))
     lease_seconds = max(60, min(int(lease_seconds or DEFAULT_LEASE_S), 86400))
     now = _now_ts()
@@ -369,12 +385,14 @@ def claim(limit: int = 10, max_bytes: int = 0,
                     "chunk_hash": row["chunk_hash"],
                     "chunk_bytes": cb,
                     "contract_version": CONTRACT_VERSION,
+                    "contract_digest": digest,
                     "expires_at": datetime.fromtimestamp(
                         expires, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
                 })
         conn.commit()
         return {"jobs": picked, "leased": len(picked),
-                "contract_version": CONTRACT_VERSION}
+                "contract_version": CONTRACT_VERSION,
+                "contract_digest": digest}
     finally:
         conn.close()
 
@@ -409,6 +427,7 @@ def read_job(job_id: str, lease_id: str) -> dict[str, object]:
             "chunk_bytes": row["chunk_bytes"],
             "chunk_markdown": row["chunk_text"],
             "contract_version": row["contract_version"],
+            "contract_digest": _contract_digest(),
             "fencing_token": row["fencing_token"],
             "expires_at": datetime.fromtimestamp(
                 int(row["expires_at"] or 0), UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -652,6 +671,185 @@ def validate_extraction(doc: object, source_path: str = "") -> tuple[bool, list[
     return (not errs), errs, warns, doc
 
 
+# ------------------------------------------------------------ contrat expose
+def _canonical_checked() -> _contract.Canonical:
+    """Contrat canonique charge ET a la version servie, sinon refus explicite."""
+    try:
+        canon = _contract.load_canonical()
+    except _contract.ContractUnavailableError as exc:
+        raise WikiJobsError(f"CONTRACT_UNAVAILABLE : {exc}") from exc
+    if canon.version != CONTRACT_VERSION:
+        raise WikiJobsError(
+            f"CONTRACT_UNAVAILABLE : version canonique {canon.version}"
+            f" != version servie {CONTRACT_VERSION}")
+    return canon
+
+
+def _augment(js: dict) -> dict:
+    """Bornes du validateur SERVEUR ajoutees au JSON Schema derive.
+
+    Generees depuis les constantes de `validate_extraction`, jamais saisies a
+    la main : le schema publie ne peut pas diverger du validateur. Un chemin
+    absent du schema canonique leve KeyError -> contrat indisponible.
+    """
+    p = js["properties"]
+    note = p["note"]["properties"]
+    note["slug"]["pattern"] = _SLUG_RE.pattern
+    note["tags"].update({"minItems": 2, "maxItems": 8})
+    note["tags"]["items"]["pattern"] = _TAG_RE.pattern
+    note["doc_date"]["pattern"] = r"^(\d{4}-\d{2}-\d{2})?$"
+    note["sections"].update({"minItems": 1, "maxItems": MAX_SECTIONS})
+    note["sections"]["items"]["properties"]["markdown"]["maxLength"] = MAX_SECTION_CHARS
+    p["confidence"].update({"minimum": 0, "maximum": 1})
+    p["entities"]["maxItems"] = MAX_ENTITIES
+    p["entities"]["items"]["properties"]["slug"]["pattern"] = _SLUG_RE.pattern
+    p["relations"]["maxItems"] = MAX_RELATIONS
+    p["relations"]["items"]["properties"]["confidence"].update({"minimum": 0, "maximum": 1})
+    p["issues"]["maxItems"] = MAX_ISSUES
+    return js
+
+
+def _server_rules() -> list[str]:
+    """Regles non exprimables en JSON Schema, generees depuis les constantes."""
+    return [
+        f"note.title non vide ; note.slug {_SLUG_RE.pattern} (sinon derive du titre, sinon refus).",
+        "note.slug UNIQUE entre sources : un slug deja porte par une AUTRE source"
+        " (spool ou wiki/sources/<slug>.md) est refuse ; tous les chunks d'une meme"
+        " source portent le meme note.slug.",
+        f"note.sections : 1 a {MAX_SECTIONS} sections non vides de {MAX_SECTION_CHARS}"
+        " caracteres max ; corps total >= 200 caracteres.",
+        f"note.tags : 2 a 8 tags {_TAG_RE.pattern} apres normalisation.",
+        "note.doc_date : AAAA-MM-JJ ou chaine vide, jamais devinee.",
+        f"entities : {MAX_ENTITIES} max ; slug {_SLUG_RE.pattern} unique dans le document ;"
+        " name sans / \\ : * ? \" < > | ; kind entity|concept ; salience"
+        " primary|secondary|passing ; evidence = citation litterale <= 200 caracteres.",
+        "entities : le validateur canonique ecarte une entite dont le slug designe le"
+        " document lui-meme (titre ou nom de fichier, ou leur reformulation) ou contient"
+        " une date ISO.",
+        "sections[].markdown : mentions uniquement {{E:slug}} d'une entite presente dans"
+        " entities ; jamais de [[wikilink]] ; pas de frontmatter YAML.",
+        f"relations : {MAX_RELATIONS} max ; from/to = slugs presents dans entities,"
+        " from != to, confidence 0..1 ; sinon ecartee.",
+        f"issues : {MAX_ISSUES} max ; code non vide ; detail <= {MAX_ISSUE_DETAIL} caracteres.",
+        "Autorite serveur : validate_extraction (vault-mcp) PUIS llm_wiki_extract.validate"
+        " (canonique) ; les deux doivent accepter.",
+    ]
+
+
+def contract(contract_version: str) -> dict[str, object]:
+    """Contrat exact de `contract_version`, derive de la source canonique.
+
+    Version inconnue -> UNKNOWN_CONTRACT_VERSION ; source canonique absente ou
+    inexploitable -> CONTRACT_UNAVAILABLE. Jamais de repli.
+    """
+    if contract_version != CONTRACT_VERSION:
+        raise WikiJobsError(
+            f"UNKNOWN_CONTRACT_VERSION : {contract_version!r}"
+            f" (seule version servie : {CONTRACT_VERSION})")
+    canon = _canonical_checked()
+    try:
+        derived = _augment(_contract.to_json_schema(canon.response_schema))
+    except (ValueError, KeyError, TypeError) as exc:
+        raise WikiJobsError(
+            f"CONTRACT_UNAVAILABLE : schema canonique inexploitable ({exc})") from exc
+    body = {
+        "contract_version": CONTRACT_VERSION,
+        "response_schema": copy.deepcopy(canon.response_schema),
+        "json_schema": {"$schema": _contract.JSON_SCHEMA_DIALECT,
+                        "title": CONTRACT_VERSION, **derived},
+        "instructions": canon.instructions,
+        "server_rules": _server_rules(),
+    }
+    return {
+        **body,
+        "contract_digest": _contract.digest(body),
+        "schema_dialect": _contract.SOURCE_DIALECT,
+        "source": {"module": canon.path, "sha256": canon.sha256},
+        "usage": "Charger une fois par contract_version et par run. Produire l'objet"
+                 " `extraction` conforme a json_schema et aux server_rules, puis"
+                 " wiki_ingest_submit(job_id, lease_id, fencing_token, contract_version,"
+                 " extraction, contract_digest).",
+    }
+
+
+def _contract_digest() -> str:
+    return str(contract(CONTRACT_VERSION)["contract_digest"])
+
+
+def _validate_all(doc: object, source_path: str) -> tuple[bool, list[str], list[str], dict]:
+    """Validateur serveur PUIS validateur canonique : les deux doivent accepter.
+
+    La sortie retenue est celle du canonique (il peut encore ecarter des
+    entites, p. ex. titre du document ou slug date) : ce qui est spoolise est
+    exactement ce que llm_wiki_extract aurait accepte.
+    """
+    ok, errs, warns, norm = validate_extraction(doc, source_path)
+    if not ok:
+        return ok, errs, warns, norm
+    canon = _canonical_checked()
+    try:
+        c_ok, c_errs, c_warns, c_norm = canon.validate(copy.deepcopy(norm), source_path)
+    except Exception as exc:  # un crash du canonique sur CE document = refus
+        return False, [f"validateur canonique en erreur : {type(exc).__name__}"], warns, norm
+    warns = warns + [str(w) for w in (c_warns or []) if str(w) not in warns]
+    if not c_ok:
+        return False, [f"canonique : {e}" for e in (c_errs or ["refus"])], warns, norm
+    if not isinstance(c_norm, dict):
+        return False, ["validateur canonique : sortie non-objet"], warns, norm
+    return True, [], warns, c_norm
+
+
+_SRC_LINE_RE = re.compile(r"^- `([^`]+)` \(sha [0-9a-f]+\)", re.M)
+_spool_slugs: dict[str, tuple[int, int, str, str]] = {}
+
+
+def _source_rel(path: str) -> str:
+    # Meme derivation que llm_wiki_merge pour la ligne `## Sources` des fiches.
+    return re.sub(r"^.*?/(raw/)", r"\1", path)
+
+
+def _slug_collision(slug: str, source_path: str) -> str | None:
+    """Autre source portant deja `note.slug`, ou None.
+
+    llm_wiki_merge indexe les documents par note.slug et ecrit
+    wiki/sources/<slug>.md : deux sources au meme slug -> la derniere ecrase
+    l'autre en silence. On verifie le wiki (ce qui serait ecrase) et le spool
+    (ce que le merge lira). Une autre version ou un autre chunk de la MEME
+    source n'est pas une collision.
+    """
+    if not WIKI_NOTES_DIR.is_dir():
+        raise WikiJobsError(f"WIKI_NOTES_DIR illisible : {WIKI_NOTES_DIR}")
+    mine = _source_rel(source_path)
+    fiche = WIKI_NOTES_DIR / "sources" / f"{slug}.md"
+    try:
+        text = fiche.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        text = None
+    except OSError as exc:
+        raise WikiJobsError(f"fiche wiki illisible : {fiche.name} ({exc.strerror})") from exc
+    if text is not None:
+        parts = text.split("\n## Sources", 1)
+        m = _SRC_LINE_RE.search(parts[1]) if len(parts) == 2 else None
+        if not m or m.group(1) != mine:
+            return f"wiki/sources/{slug}.md ({m.group(1) if m else 'source inconnue'})"
+    if SPOOL_DIR.is_dir():
+        for p in SPOOL_DIR.rglob("*.json"):
+            try:
+                st = p.stat()
+                hit = _spool_slugs.get(str(p))
+                if not hit or hit[:2] != (st.st_mtime_ns, st.st_size):
+                    env = json.loads(p.read_text(encoding="utf-8"))
+                    hit = (st.st_mtime_ns, st.st_size,
+                           str((env.get("note") or {}).get("slug") or ""),
+                           str((env.get("source") or {}).get("path") or ""))
+                    _spool_slugs[str(p)] = hit
+            except (OSError, ValueError, AttributeError):
+                continue  # illisible : le merge l'ignore aussi
+            if hit[2] == slug and _source_rel(hit[3]) != mine:
+                return f"spool {p.name} ({_source_rel(hit[3])})"
+    return None
+
+
 def _canonical(doc: dict) -> str:
     return json.dumps(doc, sort_keys=True, ensure_ascii=False)
 
@@ -661,13 +859,19 @@ def _spool_path(source_hash: str, idx: int) -> Path:
 
 
 def _write_atomic_json(path: Path, obj: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.parent.is_dir():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            path.parent.chmod(SPOOL_DIR_MODE)
     tmp = path.with_name(path.name + f".tmp.{os.getpid()}.{uuid.uuid4().hex[:8]}")
     with tmp.open("w", encoding="utf-8") as fh:
         json.dump(obj, fh, ensure_ascii=False, indent=1)
         fh.write("\n")
         fh.flush()
         os.fsync(fh.fileno())
+    # Explicite : sous UMask=0077 le fichier naitrait 0600, illisible par
+    # llm_wiki_merge (llmingest) qui l'ignorerait en silence.
+    tmp.chmod(SPOOL_FILE_MODE)
     os.replace(tmp, path)
     try:
         d = os.open(str(path.parent), os.O_RDONLY)
@@ -681,13 +885,26 @@ def _write_atomic_json(path: Path, obj: dict) -> None:
 
 # ------------------------------------------------------------------ submit
 def submit(job_id: str, lease_id: str, fencing_token: int,
-           contract_version: str, extraction: dict) -> dict[str, object]:
-    """Soumission idempotente + spool immediat si valide."""
+           contract_version: str, extraction: dict,
+           contract_digest: str = "") -> dict[str, object]:
+    """Soumission idempotente + spool immediat si valide.
+
+    Refus sans effet sur le job (ni tentative consommee, ni bail touche) :
+    version inconnue, contrat indisponible, digest perime.
+    """
     if contract_version != CONTRACT_VERSION:
         raise WikiJobsError(
-            f"contract_version perimee : {contract_version} (attendue {CONTRACT_VERSION})")
+            f"UNKNOWN_CONTRACT_VERSION : contract_version perimee ou inconnue :"
+            f" {contract_version} (attendue {CONTRACT_VERSION})")
     if not isinstance(extraction, dict):
         raise WikiJobsError("extraction non-objet")
+    current = _contract_digest()
+    if contract_digest and contract_digest != current:
+        raise WikiJobsError(
+            "CONTRACT_DIGEST_MISMATCH : le contrat a change depuis son chargement,"
+            " recharger wiki_ingest_contract puis refaire l'extraction")
+    # Jamais muter l'objet de l'appelant : la normalisation travaille sur copie.
+    extraction = copy.deepcopy(extraction)
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -719,8 +936,12 @@ def submit(job_id: str, lease_id: str, fencing_token: int,
         # entre-temps) doit rendre le meme recu, pas une erreur de bail.
         if row["status"] in ("submitted", "merged") and row["payload_hash"]:
             # Idempotence : meme payload -> meme recu ; payload != -> conflit.
-            canon = _canonical(extraction)
-            ph = hashlib.sha256(canon.encode("utf-8")).hexdigest()
+            # Le hash stocke est celui du payload NORMALISE : un rejeu arrive en
+            # JSON frais (doc_date "" non encore devenu None...), il doit donc
+            # etre normalise de la meme facon avant comparaison.
+            ok_d, _, _, norm_d = _validate_all(extraction, row["source"])
+            ph = (hashlib.sha256(_canonical(norm_d).encode("utf-8")).hexdigest()
+                  if ok_d else "")
             if ph == row["payload_hash"]:
                 conn.commit()
                 return {"receipt_id": row["receipt_id"], "duplicate": True,
@@ -741,7 +962,13 @@ def submit(job_id: str, lease_id: str, fencing_token: int,
         if row["status"] != "leased":
             raise WikiJobsError(f"job non loue (status={row['status']})")
 
-        ok, errs, warns, norm = validate_extraction(extraction, row["source"])
+        ok, errs, warns, norm = _validate_all(extraction, row["source"])
+        if ok:
+            collision = _slug_collision(str(norm["note"]["slug"]), row["source"])
+            if collision:
+                ok = False
+                errs = [f"note.slug {norm['note']['slug']!r} deja porte par une autre"
+                        f" source : {collision} ; choisir un slug distinct"]
         if not ok:
             att = int(row["attempts"] or 0) + 1
             status = "quarantined" if att >= MAX_ATTEMPTS else "deferred"
@@ -805,6 +1032,11 @@ def release(job_id: str, lease_id: str, action: str = "release",
             raise WikiJobsError("job inconnu")
         if not lease_id or row["lease_id"] != lease_id:
             raise WikiJobsError("lease-invalid")
+        # Un job soumis garde son lease_id (rejeu idempotent) : sans cette
+        # garde, un release de fin de run le renverrait en `pending` et le
+        # retirerait du groupe attendu par merge_pending (double cloture).
+        if row["status"] != "leased":
+            raise WikiJobsError(f"job non loue (status={row['status']}) : rien a liberer")
         now = _now_iso()
         if action == "release":
             conn.execute(
@@ -869,6 +1101,10 @@ def status() -> dict[str, object]:
             " AND status IN ('pending','deferred')", (CONTRACT_VERSION,)).fetchone()
         leased = conn.execute(
             "SELECT COUNT(*) n FROM wiki_jobs WHERE status='leased'").fetchone()
+        # Baux morts : comptes dans `leased` mais reattribuables par claim.
+        leased_expired = conn.execute(
+            "SELECT COUNT(*) n FROM wiki_jobs WHERE status='leased'"
+            " AND expires_at IS NOT NULL AND expires_at < ?", (_now_ts(),)).fetchone()
         last_merge = conn.execute(
             "SELECT merged_at FROM wiki_jobs WHERE status='merged'"
             " ORDER BY merged_at DESC LIMIT 1").fetchone()
@@ -887,6 +1123,7 @@ def status() -> dict[str, object]:
             "pending_docs": int((docs["n"] if docs else 0) or 0),
             "pending_chunks": int((chunks["n"] if chunks else 0) or 0),
             "leased": int((leased["n"] if leased else 0) or 0),
+            "leased_expired": int((leased_expired["n"] if leased_expired else 0) or 0),
             "submitted_spooled": int(counts.get("submitted", 0) or 0),
             "spool_files": spooled,
             "merged": int(counts.get("merged", 0) or 0),
@@ -922,6 +1159,9 @@ def merge_pending(limit: int = 0, max_ms: int = 0) -> dict[str, object]:
     t0 = time.time()
     merged = failed = 0
     errors: list[str] = []
+    # Contrat indisponible : ne rien toucher, sinon chaque groupe echouerait
+    # sa re-validation et finirait en quarantaine pour une panne d'infra.
+    _canonical_checked()
     conn = connect()
     conn.isolation_level = None  # transactions gerees explicitement ci-dessous
     try:
@@ -980,7 +1220,7 @@ def merge_pending(limit: int = 0, max_ms: int = 0) -> dict[str, object]:
                            "confidence": (env.get("extraction") or {}).get("confidence", 0),
                            "note": env.get("note"), "entities": env.get("entities"),
                            "relations": env.get("relations"), "issues": env.get("issues")}
-                    ok, errs_v, _, _ = validate_extraction(doc, j["source"])
+                    ok, errs_v, _, _ = _validate_all(doc, j["source"])
                     if not ok:
                         raise WikiJobsError(f"re-validation : {'; '.join(errs_v)[:200]}")
                 # Manifeste AVANT le basculeur d'etat : en cas de crash entre

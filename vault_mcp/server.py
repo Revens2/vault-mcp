@@ -1232,9 +1232,11 @@ def wiki_ingest_claim(limit: int = 10, max_bytes: int = 0,
     """Atomically lease up to `limit` (<=10) immediately-processable Wiki jobs.
 
     Each job carries job_id, lease_id, fencing_token, source, source_hash,
-    chunk_index/count/hash, size, contract_version, expiry. Never leases more
-    than can be processed right away; empty queue returns `jobs: []`.
-    Requires `mcp:ecriture`.
+    chunk_index/count/hash, size, contract_version, contract_digest, expiry.
+    Before extracting, load each distinct contract_version ONCE with
+    `wiki_ingest_contract`. Never leases more than can be processed right
+    away; empty queue returns `jobs: []`; no canonical contract -> refused,
+    nothing leased. Requires `mcp:ecriture`.
     """
     refus = _exiger_ecriture()
     if refus:
@@ -1262,24 +1264,50 @@ def wiki_ingest_read(job_id: str, lease_id: str) -> dict[str, object]:
 
 
 @mcp.tool()
+def wiki_ingest_contract(contract_version: str) -> dict[str, object]:
+    """Exact extraction contract for a `contract_version` returned by claim/read.
+
+    Load it ONCE per distinct contract_version per run, before producing any
+    extraction. Returns `json_schema` (JSON Schema 2020-12 of the `extraction`
+    object expected by wiki_ingest_submit), the canonical `response_schema`
+    it is mechanically derived from, the canonical extraction `instructions`,
+    `server_rules` that JSON Schema cannot express, and `contract_digest`
+    (also carried by claim/read; pass it to submit). Built at call time from
+    the same canonical source the server validator uses, never a copy.
+    Unknown version -> UNKNOWN_CONTRACT_VERSION; canonical source unavailable
+    -> CONTRACT_UNAVAILABLE (never a fallback schema). Read-only (`mcp:lecture`).
+    """
+    try:
+        return convia_mcp.wiki_contract(contract_version)
+    except (convia_mcp.ConviaError, OSError) as exc:
+        return _erreur(f"ERREUR: {exc}")
+
+
+@mcp.tool()
 def wiki_ingest_submit(job_id: str, lease_id: str, fencing_token: int,
-                       contract_version: str, extraction: dict) -> dict[str, object]:
+                       contract_version: str, extraction: dict,
+                       contract_digest: str = "") -> dict[str, object]:
     """Submit the structured extraction for a leased job. Server validates, always.
 
-    The payload must follow the Wiki extraction contract (note/entities/
-    relations/issues). The server is authoritative: valid JSON is not enough —
-    slugs, tags, sections, entity references and relations are re-checked, a
-    stale source is refused, a fencing mismatch is refused. Idempotent: same
-    identity + same canonical payload returns the same receipt with
-    `duplicate: true`; a different payload for the same identity is an explicit
-    conflict, never a silent overwrite. Requires `mcp:ecriture`.
+    `extraction` must conform to the contract returned by
+    `wiki_ingest_contract(contract_version)` (its `json_schema` and
+    `server_rules`); pass that `contract_digest`: a stale digest is refused
+    (CONTRACT_DIGEST_MISMATCH) without consuming an attempt. The server is
+    authoritative: valid JSON is not enough — its validator then the
+    canonical one re-check slugs, tags, sections, entity references and
+    relations; a note.slug already used by another source, a stale source or
+    a fencing mismatch is refused. Idempotent: same identity + same canonical
+    payload returns the same receipt with `duplicate: true`; a different
+    payload for the same identity is an explicit conflict, never a silent
+    overwrite. Requires `mcp:ecriture`.
     """
     refus = _exiger_ecriture()
     if refus:
         return _erreur(refus)
     try:
         return convia_mcp.wiki_submit(job_id, lease_id, fencing_token,
-                                      contract_version, extraction)
+                                      contract_version, extraction,
+                                      contract_digest or "")
     except (convia_mcp.ConviaError, OSError) as exc:
         return _erreur(f"ERREUR: {exc}")
 
@@ -1307,7 +1335,9 @@ def wiki_ingest_merge_pending(limit: int = 0, max_ms: int = 0) -> dict[str, obje
 
     Re-validates, enforces CAS, appends to the manifest, idempotent and
     resumable: an interrupted merge converges on retry. One job's error never
-    stops the following independent jobs. Requires `mcp:ecriture`.
+    stops the following independent jobs. When something was merged, requests
+    the deterministic note merge (llm_wiki_merge, zero LLM) that writes the
+    wiki notes (`note_merge_requested`). Requires `mcp:ecriture`.
     """
     refus = _exiger_ecriture()
     if refus:

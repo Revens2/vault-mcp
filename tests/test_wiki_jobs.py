@@ -9,11 +9,18 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+import re
 import sqlite3
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
 import pytest
+
+FACTICE = Path(__file__).parent / "fixtures" / "contrat_wiki_factice.py"
+REEL = Path(os.environ.get("WIKI_CONTRACT_MODULE_REEL", "/usr/local/bin/llm_wiki_extract.py"))
 
 
 def _valid_extraction(slug="doc-test", title="Doc test"):
@@ -56,6 +63,11 @@ def wj(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                        + ":/srv/vault-mirror/raw/assets/ConvIA")
     monkeypatch.setenv("WIKI_CHUNK_MIN_TOKENS", "40")
     monkeypatch.setenv("WIKI_CHUNK_MIN_FLOOR", "8")
+    monkeypatch.setenv("WIKI_CONTRACT_MODULE", str(FACTICE))
+    monkeypatch.setenv("WIKI_NOTES_DIR", str(tmp_path / "wiki"))
+    # Jamais le vrai marqueur : il declencherait la fusion des fiches en prod.
+    monkeypatch.setenv("WIKI_INGEST_REQUEST", str(tmp_path / "wiki-ingest.request"))
+    (tmp_path / "wiki" / "sources").mkdir(parents=True)
     from vault_mcp import wiki_jobs
     importlib.reload(wiki_jobs)
     return wiki_jobs
@@ -304,8 +316,10 @@ def _drain_all(wj, source="raw/a.md", sha="a" * 64):
         if not got["leased"]:
             break
         for job in got["jobs"]:
+            # Un slug par source : deux sources au meme note.slug sont refusees.
             wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
-                      wj.CONTRACT_VERSION, _valid_extraction())
+                      wj.CONTRACT_VERSION,
+                      _valid_extraction(slug="doc-" + Path(job["source"]).stem))
             n += 1
     return n
 
@@ -415,7 +429,8 @@ def test_outils_mcp_exposes():
     for tool in ("convia_status", "convia_scan", "convia_list_pending_analysis",
                  "convia_read_for_analysis", "convia_write_analysis",
                  "wiki_ingest_status", "wiki_ingest_start", "wiki_ingest_claim",
-                 "wiki_ingest_read", "wiki_ingest_submit", "wiki_ingest_release",
+                 "wiki_ingest_read", "wiki_ingest_contract",
+                 "wiki_ingest_submit", "wiki_ingest_release",
                  "wiki_ingest_merge_pending", "wiki_ingest_sync"):
         assert callable(getattr(server, tool)), tool
 
@@ -535,3 +550,367 @@ def test_wiki_sync_wrapper_mcp(mcp):
     convia_mcp, wj = mcp
     with pytest.raises(convia_mcp.ConviaError, match="non numerique"):
         convia_mcp.wiki_sync(limit_files="beaucoup")
+
+
+# ------------------------------------------------------------ contrat expose
+COURT = "# Court\n\nun seul chunk."
+
+
+def _frais(doc):
+    """Payload tel qu'il arrive par MCP : un JSON neuf a chaque appel."""
+    return json.loads(json.dumps(doc))
+
+
+def _row(wj, job_id):
+    conn = wj.connect()
+    try:
+        return dict(conn.execute("SELECT * FROM wiki_jobs WHERE job_id=?", (job_id,)).fetchone())
+    finally:
+        conn.close()
+
+
+def _module_de_reference(path):
+    import runpy
+    avant = list(sys.path)
+    try:
+        return runpy.run_path(str(path))
+    finally:
+        sys.path[:] = avant
+
+
+def _claim_un(wj, source="raw/a.md", sha="a" * 64, contenu=COURT):
+    wj.sync_source(source, sha, contenu)
+    return wj.claim(limit=1)["jobs"][0]
+
+
+def test_contrat_version_connue_schema_exact_de_la_source(wj):
+    ref = _module_de_reference(FACTICE)
+    c = wj.contract(wj.CONTRACT_VERSION)
+    assert c["contract_version"] == wj.CONTRACT_VERSION
+    assert c["response_schema"] == ref["RESPONSE_SCHEMA"]  # la source, pas une copie
+    assert c["instructions"] == ref["SYSTEM_PREFIX"]
+    assert c["source"]["module"] == str(FACTICE)
+    js = c["json_schema"]
+    assert js["properties"]["note"]["properties"]["slug"]["pattern"] == wj._SLUG_RE.pattern
+    assert js["properties"]["note"]["properties"]["doc_date"]["type"] == ["string", "null"]
+    assert "propertyOrdering" not in json.dumps(js)
+    assert re.fullmatch(r"[0-9a-f]{64}", c["contract_digest"])
+    assert wj.contract(wj.CONTRACT_VERSION)["contract_digest"] == c["contract_digest"]
+
+
+def test_contrat_version_inconnue_refusee(wj):
+    for v in ("wiki-extract-v3", "wiki-extract-v5", ""):
+        with pytest.raises(wj.WikiJobsError, match="UNKNOWN_CONTRACT_VERSION"):
+            wj.contract(v)
+
+
+def test_contrat_wrapper_mcp(mcp):
+    convia_mcp, wj = mcp
+    assert convia_mcp.wiki_contract(wj.CONTRACT_VERSION)["contract_version"] == wj.CONTRACT_VERSION
+    with pytest.raises(convia_mcp.ConviaError, match="UNKNOWN_CONTRACT_VERSION"):
+        convia_mcp.wiki_contract("wiki-extract-v3")
+
+
+def test_contrat_absent_fail_closed_rien_n_est_loue(wj, tmp_path, monkeypatch):
+    wj.sync_source("raw/a.md", "a" * 64, COURT)
+    monkeypatch.setenv("WIKI_CONTRACT_MODULE", str(tmp_path / "absent.py"))
+    with pytest.raises(wj.WikiJobsError, match="CONTRACT_UNAVAILABLE"):
+        wj.contract(wj.CONTRACT_VERSION)
+    with pytest.raises(wj.WikiJobsError, match="CONTRACT_UNAVAILABLE"):
+        wj.claim(limit=1)
+    assert wj.status()["leased"] == 0
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda t: t.replace('CONTRACT_VERSION = "wiki-extract-v4"',
+                        'CONTRACT_VERSION = "wiki-extract-v5"'),
+    lambda t: t + '\nRESPONSE_SCHEMA["anyOf"] = []\n',
+    lambda t: t + "\nraise RuntimeError('import casse')\n",
+    lambda t: t.replace("def validate(", "def _plus_de_validate("),
+])
+def test_contrat_canonique_inexploitable_fail_closed(wj, tmp_path, monkeypatch, mutation):
+    autre = tmp_path / "canonique.py"
+    autre.write_text(mutation(FACTICE.read_text(encoding="utf-8")), encoding="utf-8")
+    monkeypatch.setenv("WIKI_CONTRACT_MODULE", str(autre))
+    with pytest.raises(wj.WikiJobsError, match="CONTRACT_UNAVAILABLE"):
+        wj.contract(wj.CONTRACT_VERSION)
+
+
+def test_wiki_contract_importable_seul():
+    # Processus neuf : aucun import prealable ne doit masquer un import manquant
+    # (importlib.abc n'est pas charge par importlib.util).
+    racine = Path(__file__).resolve().parent.parent
+    subprocess.run([sys.executable, "-c", "import vault_mcp.wiki_contract"],
+                   cwd=racine, check=True, capture_output=True)
+
+
+def test_chargement_restaure_sys_path(wj):
+    wj._contract._cache.clear()
+    avant = list(sys.path)
+    wj.contract(wj.CONTRACT_VERSION)
+    assert sys.path == avant
+
+
+def test_claim_et_read_portent_le_digest(wj):
+    digest = wj.contract(wj.CONTRACT_VERSION)["contract_digest"]
+    wj.sync_source("raw/a.md", "a" * 64, COURT)
+    got = wj.claim(limit=1)
+    job = got["jobs"][0]
+    assert got["contract_digest"] == job["contract_digest"] == digest
+    assert wj.read_job(job["job_id"], job["lease_id"])["contract_digest"] == digest
+
+
+def test_digest_perime_refuse_sans_consommer_de_tentative(wj, tmp_path, monkeypatch):
+    job = _claim_un(wj)
+    vieux = job["contract_digest"]
+    modif = tmp_path / "canonique.py"
+    modif.write_text(FACTICE.read_text(encoding="utf-8")
+                     + '\nSYSTEM_PREFIX = SYSTEM_PREFIX + " v2"\n', encoding="utf-8")
+    monkeypatch.setenv("WIKI_CONTRACT_MODULE", str(modif))
+    with pytest.raises(wj.WikiJobsError, match="CONTRACT_DIGEST_MISMATCH"):
+        wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                  wj.CONTRACT_VERSION, _valid_extraction(), contract_digest=vieux)
+    row = _row(wj, job["job_id"])
+    assert row["status"] == "leased" and row["attempts"] == 0
+    neuf = wj.contract(wj.CONTRACT_VERSION)["contract_digest"]
+    assert neuf != vieux
+    recu = wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                     wj.CONTRACT_VERSION, _valid_extraction(), contract_digest=neuf)
+    assert recu["duplicate"] is False
+
+
+def test_json_schema_derive_valide_et_coherent_avec_le_validateur(wj):
+    jsonschema = pytest.importorskip("jsonschema")
+    js = wj.contract(wj.CONTRACT_VERSION)["json_schema"]
+    jsonschema.Draft202012Validator.check_schema(js)
+    jsonschema.validate(_valid_extraction(), js)
+    bad = _valid_extraction()
+    bad["note"]["tags"] = ["un"]
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(bad, js)
+
+
+# ------------------------------------------------------------ submit (contrat)
+def test_submit_mauvaise_version_sans_effet(wj):
+    job = _claim_un(wj)
+    with pytest.raises(wj.WikiJobsError, match="UNKNOWN_CONTRACT_VERSION"):
+        wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                  "wiki-extract-v3", _valid_extraction())
+    row = _row(wj, job["job_id"])
+    assert row["status"] == "leased" and row["attempts"] == 0
+
+
+@pytest.mark.parametrize("casse, motif", [
+    (lambda d: d.pop("note"), "note absente"),
+    (lambda d: d["note"].update(slug="!!!", title=""), "note.slug"),
+    (lambda d: d["note"].update(tags=["un"]), "note.tags"),
+    (lambda d: d["note"].update(sections=[]), "sections"),
+    (lambda d: d.update(issues=[{"code": "rejet-canonique", "detail": "x"}]), "canonique"),
+])
+def test_submit_invalide_refuse(wj, casse, motif):
+    job = _claim_un(wj)
+    doc = _valid_extraction()
+    casse(doc)
+    with pytest.raises(wj.WikiJobsError, match="validation refusee"):
+        wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                  wj.CONTRACT_VERSION, doc)
+    row = _row(wj, job["job_id"])
+    assert row["status"] == "pending" and row["attempts"] == 1
+    assert motif in row["last_error"]
+    assert wj.status()["spool_files"] == 0
+
+
+def test_submit_relation_invalide_ecartee_du_spool(wj):
+    job = _claim_un(wj)
+    doc = _valid_extraction()
+    doc["relations"] = [{"from": "ent-test", "to": "fantome", "type": "appelle",
+                         "evidence": "x", "confidence": 0.9},
+                        {"from": "ent-test", "to": "ent-test", "type": "boucle",
+                         "evidence": "x", "confidence": 0.9}]
+    wj.submit(job["job_id"], job["lease_id"], job["fencing_token"], wj.CONTRACT_VERSION, doc)
+    env = json.loads(wj._spool_path(job["source_hash"], 0).read_text(encoding="utf-8"))
+    assert env["relations"] == []
+
+
+def test_sortie_du_validateur_canonique_est_celle_spoolee(wj):
+    job = _claim_un(wj)
+    doc = _valid_extraction()
+    doc["entities"].append(dict(doc["entities"][0], slug="sauvegarde-2026-01-02"))
+    recu = wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                     wj.CONTRACT_VERSION, doc)
+    env = json.loads(wj._spool_path(job["source_hash"], 0).read_text(encoding="utf-8"))
+    assert [e["slug"] for e in env["entities"]] == ["ent-test"]
+    assert "entite datee rejetee" in recu["warnings"]
+
+
+def test_submit_ne_mute_pas_l_objet_de_l_appelant(wj):
+    job = _claim_un(wj)
+    doc = _valid_extraction()
+    avant = json.dumps(doc, sort_keys=True)
+    wj.submit(job["job_id"], job["lease_id"], job["fencing_token"], wj.CONTRACT_VERSION, doc)
+    assert json.dumps(doc, sort_keys=True) == avant
+
+
+def test_rejeu_json_frais_reconnu_idempotent(wj):
+    # doc_date "" est normalise en None : l'ancien code comparait le hash du
+    # payload BRUT au hash NORMALISE et rendait un faux conflit au rejeu reel.
+    job = _claim_un(wj)
+    doc = _valid_extraction()
+    assert doc["note"]["doc_date"] == ""
+    r1 = wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                   wj.CONTRACT_VERSION, _frais(doc))
+    r2 = wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                   wj.CONTRACT_VERSION, _frais(doc))
+    assert r2["duplicate"] is True and r2["receipt_id"] == r1["receipt_id"]
+    assert wj.status()["spool_files"] == 1
+    assert wj.merge_pending()["merged"] == 1
+    r3 = wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                   wj.CONTRACT_VERSION, _frais(doc))
+    assert r3["duplicate"] is True
+    assert wj.merge_pending()["merged"] == 0  # aucun second merge
+    lignes = Path(wj.MANIFEST_PATH).read_text(encoding="utf-8").strip().splitlines()
+    assert len(lignes) == 1
+
+
+def test_collision_de_slug_avec_une_autre_source_du_spool(wj):
+    a = _claim_un(wj, "raw/a.md", "a" * 64)
+    wj.submit(a["job_id"], a["lease_id"], a["fencing_token"], wj.CONTRACT_VERSION,
+              _valid_extraction(slug="meme-slug"))
+    b = _claim_un(wj, "raw/b.md", "b" * 64)
+    with pytest.raises(wj.WikiJobsError, match="deja porte par une autre source"):
+        wj.submit(b["job_id"], b["lease_id"], b["fencing_token"], wj.CONTRACT_VERSION,
+                  _valid_extraction(slug="meme-slug"))
+    b = wj.claim(limit=1)["jobs"][0]
+    assert wj.submit(b["job_id"], b["lease_id"], b["fencing_token"], wj.CONTRACT_VERSION,
+                     _valid_extraction(slug="autre-slug"))["receipt_id"]
+
+
+def test_collision_de_slug_avec_une_fiche_wiki_existante(wj):
+    fiche = wj.WIKI_NOTES_DIR / "sources" / "doc-test.md"
+    fiche.write_text("---\ntype: source\n---\n# X\n\n## Sources\n\n"
+                     "- `raw/autre.md` (sha 12345678)\n", encoding="utf-8")
+    job = _claim_un(wj)
+    with pytest.raises(wj.WikiJobsError, match="deja porte"):
+        wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                  wj.CONTRACT_VERSION, _valid_extraction())
+    # La fiche de la MEME source est une mise a jour, pas une collision.
+    fiche.write_text("# X\n\n## Sources\n\n- `raw/a.md` (sha 12345678)\n", encoding="utf-8")
+    job = wj.claim(limit=1)["jobs"][0]
+    assert wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                     wj.CONTRACT_VERSION, _valid_extraction())["receipt_id"]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="modes POSIX")
+def test_spool_lisible_par_le_groupe_malgre_umask(wj):
+    old = os.umask(0o077)
+    try:
+        job = _claim_un(wj)
+        wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                  wj.CONTRACT_VERSION, _valid_extraction())
+    finally:
+        os.umask(old)
+    p = wj._spool_path(job["source_hash"], 0)
+    assert p.stat().st_mode & 0o777 == 0o660
+    assert p.parent.stat().st_mode & 0o7777 == 0o2775
+
+
+# ------------------------------------------------------------ baux / fencing
+def test_bail_expire_ancien_bail_et_ancien_fencing_refuses(wj):
+    job = _claim_un(wj)
+    conn = wj.connect()
+    conn.execute("UPDATE wiki_jobs SET expires_at=1 WHERE job_id=?", (job["job_id"],))
+    conn.commit()
+    conn.close()
+    assert wj.status()["leased_expired"] == 1
+    neuf = wj.claim(limit=1)["jobs"][0]
+    assert neuf["job_id"] == job["job_id"] and neuf["fencing_token"] == job["fencing_token"] + 1
+    with pytest.raises(wj.WikiJobsError, match="lease-invalid"):
+        wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                  wj.CONTRACT_VERSION, _valid_extraction())
+    with pytest.raises(wj.WikiJobsError, match="fencing"):
+        wj.submit(neuf["job_id"], neuf["lease_id"], job["fencing_token"],
+                  wj.CONTRACT_VERSION, _valid_extraction())
+    assert wj.submit(neuf["job_id"], neuf["lease_id"], neuf["fencing_token"],
+                     wj.CONTRACT_VERSION, _valid_extraction())["duplicate"] is False
+    assert wj.status()["leased_expired"] == 0
+
+
+def test_release_apres_submit_refuse_pas_de_double_cloture(wj):
+    job = _claim_un(wj)
+    wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
+              wj.CONTRACT_VERSION, _valid_extraction())
+    for action in ("release", "defer", "renew"):
+        with pytest.raises(wj.WikiJobsError, match="non loue"):
+            wj.release(job["job_id"], job["lease_id"], action)
+    assert _row(wj, job["job_id"])["status"] == "submitted"
+    assert wj.merge_pending()["merged"] == 1
+    with pytest.raises(wj.WikiJobsError, match="lease-invalid"):
+        wj.release(job["job_id"], job["lease_id"], "release")
+    assert _row(wj, job["job_id"])["status"] == "merged"
+
+
+# ------------------------------------------------------------ merge
+def test_merge_pending_demande_la_fusion_des_fiches(mcp):
+    convia_mcp, wj = mcp
+    job = _claim_un(wj)
+    convia_mcp.wiki_submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                           wj.CONTRACT_VERSION, _valid_extraction(),
+                           job["contract_digest"])
+    assert not convia_mcp.INGEST_REQUEST.exists()
+    res = convia_mcp.wiki_merge_pending()
+    assert res["merged"] == 1 and res["note_merge_requested"] is True
+    assert convia_mcp.INGEST_REQUEST.exists()
+    convia_mcp.INGEST_REQUEST.unlink()
+    again = convia_mcp.wiki_merge_pending()
+    assert again["merged"] == 0 and again["note_merge_requested"] is False
+    assert not convia_mcp.INGEST_REQUEST.exists()
+
+
+def test_merge_pending_contrat_indisponible_ne_touche_rien(wj, tmp_path, monkeypatch):
+    job = _claim_un(wj)
+    wj.submit(job["job_id"], job["lease_id"], job["fencing_token"],
+              wj.CONTRACT_VERSION, _valid_extraction())
+    monkeypatch.setenv("WIKI_CONTRACT_MODULE", str(tmp_path / "absent.py"))
+    with pytest.raises(wj.WikiJobsError, match="CONTRACT_UNAVAILABLE"):
+        wj.merge_pending()
+    row = _row(wj, job["job_id"])
+    assert row["status"] == "submitted" and row["attempts"] == 0
+
+
+# ------------------------------------------------------------ contrat reel (VPS)
+reel = pytest.mark.skipif(not REEL.is_file(), reason="contrat canonique absent (hors VPS)")
+
+
+@reel
+def test_contrat_reel_identique_a_print_schema(wj, monkeypatch):
+    monkeypatch.setenv("WIKI_CONTRACT_MODULE", str(REEL))
+    c = wj.contract(wj.CONTRACT_VERSION)
+    out = subprocess.run([sys.executable, str(REEL), "--print-schema"],
+                         capture_output=True, text=True, check=True).stdout
+    assert c["response_schema"] == json.loads(out)
+    assert c["instructions"] == _module_de_reference(REEL)["SYSTEM_PREFIX"]
+
+
+@reel
+def test_contrat_reel_json_schema_et_flux_complet(mcp, monkeypatch):
+    jsonschema = pytest.importorskip("jsonschema")
+    convia_mcp, wj = mcp
+    monkeypatch.setenv("WIKI_CONTRACT_MODULE", str(REEL))
+    c = convia_mcp.wiki_contract(wj.CONTRACT_VERSION)
+    jsonschema.Draft202012Validator.check_schema(c["json_schema"])
+    doc = _valid_extraction(title="Audit latence gateway", slug="audit-latence-gateway")
+    jsonschema.validate(doc, c["json_schema"])
+    # Entite = le document lui-meme : ecartee par le canonique, pas par vault-mcp.
+    doc["entities"].append(dict(doc["entities"][0], slug="audit-latence-gateway",
+                                name="Audit latence gateway"))
+    job = _claim_un(wj)
+    assert job["contract_digest"] == c["contract_digest"]
+    recu = convia_mcp.wiki_submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                                  wj.CONTRACT_VERSION, _frais(doc), c["contract_digest"])
+    env = json.loads(wj._spool_path(job["source_hash"], 0).read_text(encoding="utf-8"))
+    assert [e["slug"] for e in env["entities"]] == ["ent-test"]
+    assert any("entite-titre" in w for w in recu["warnings"])
+    assert convia_mcp.wiki_submit(job["job_id"], job["lease_id"], job["fencing_token"],
+                                  wj.CONTRACT_VERSION, _frais(doc),
+                                  c["contract_digest"])["duplicate"] is True
+    assert convia_mcp.wiki_merge_pending()["merged"] == 1

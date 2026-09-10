@@ -406,13 +406,23 @@ def wiki_read(job_id: str, lease_id: str) -> dict[str, object]:
         raise ConviaError(str(exc))
 
 
+def wiki_contract(contract_version: str) -> dict[str, object]:
+    """Contrat exact d'extraction, derive de la source canonique. Lecture seule."""
+    try:
+        return _wiki_jobs.contract(str(contract_version or ""))
+    except (OSError, _wiki_jobs.WikiJobsError) as exc:
+        raise ConviaError(str(exc))
+
+
 def wiki_submit(job_id: str, lease_id: str, fencing_token: int,
-                contract_version: str, extraction: dict) -> dict[str, object]:
+                contract_version: str, extraction: dict,
+                contract_digest: str = "") -> dict[str, object]:
     """Soumission validee serveur + spool immediat. Idempotente."""
     try:
         return _wiki_jobs.submit(job_id, lease_id,
                                  _entier(fencing_token, -1, "fencing_token"),
-                                 contract_version, extraction)
+                                 contract_version, extraction,
+                                 contract_digest=str(contract_digest or ""))
     except (OSError, _wiki_jobs.WikiJobsError) as exc:
         raise ConviaError(str(exc))
 
@@ -426,13 +436,41 @@ def wiki_release(job_id: str, lease_id: str, action: str = "release",
         raise ConviaError(str(exc))
 
 
-def wiki_merge_pending(limit: int = 0, max_ms: int = 0) -> dict[str, object]:
-    """Drain deterministe du spool valide. Zero LLM."""
+def _request_note_merge() -> tuple[bool, str]:
+    """Depose la demande consommee par llm-wiki-ingest-request.path (root).
+
+    Le moteur demarre est la passe 2 deterministe (llm_wiki_merge, aucun LLM
+    depuis la bascule ChatGPT-seul) : c'est elle, et elle seule, qui ecrit les
+    fiches du wiki a partir du spool. Meme mecanisme de depot que l'ancien
+    `ingest_start` (le MCP n'escalade jamais), sans rebrancher l'ancien worker.
+    """
     try:
-        return _wiki_jobs.merge_pending(limit=_entier(limit, 0, "limit"),
-                                        max_ms=_entier(max_ms, 0, "max_ms"))
+        INGEST_REQUEST.parent.mkdir(parents=True, exist_ok=True)
+        INGEST_REQUEST.write_text(
+            datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ") + "\n", encoding="utf-8")
+    except OSError as exc:
+        return False, f"{type(exc).__name__}: {exc.strerror or exc}"
+    return True, ""
+
+
+def wiki_merge_pending(limit: int = 0, max_ms: int = 0) -> dict[str, object]:
+    """Drain deterministe du spool valide. Zero LLM.
+
+    Si au moins un groupe passe `merged`, demande la fusion des fiches : sans
+    elle, la file disait `merged` alors qu'aucune fiche n'etait ecrite.
+    """
+    try:
+        res = _wiki_jobs.merge_pending(limit=_entier(limit, 0, "limit"),
+                                       max_ms=_entier(max_ms, 0, "max_ms"))
     except (OSError, _wiki_jobs.WikiJobsError) as exc:
         raise ConviaError(str(exc))
+    res["note_merge_requested"] = False
+    if int(res.get("merged") or 0) > 0:
+        ok, err = _request_note_merge()
+        res["note_merge_requested"] = ok
+        if err:
+            res["note_merge_error"] = err
+    return res
 
 
 def wiki_sync(limit_files: int = 200) -> dict[str, object]:
