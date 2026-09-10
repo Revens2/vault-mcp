@@ -1,0 +1,13 @@
+[Unit]
+# Declenchement des qu'un chemin sale est depose. PathExistsGlob sur les FICHIERS
+# de la file, comme vault-spool-push.path : PathChanged sur le repertoire se
+# declencherait aussi sur les temporaires d'ecriture, donc sur des entrees
+# incompletes.
+Description=Declenchement de l indexation incrementale des qu un chemin est sali
+
+[Path]
+PathExistsGlob=/srv/vault-spool/dirty/queue/*.path
+Unit=vault-index-worker.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+[Unit]
+# Deux roles, aucun n'est un simple filet anti-crash :
+#  1. rattraper une entree deposee dans la fenetre de re-armement du watch inotify
+#     du .path unit (meme piege que vault-spool-push.timer, constate le 2026-09-05) ;
+#  2. porter la RECONCILIATION : les notes qui arrivent par `rclone sync` (edition
+#     depuis Obsidian sur un autre poste) n'ont AUCUNE intention de spool, donc
+#     personne ne les salit. Le mode --reconcilier compare le miroir a l'index
+#     publie et rattrape les ecarts. Sans lui, une edition externe attendrait le
+#     full de 03:30.
+# 10 min : vault-mirror-sync tourne toutes les ~20 min, on veut au moins un
+# passage de reconciliation apres chaque sync.
+Description=Rattrapage et reconciliation de l index incremental du vault
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+AccuracySec=30s
+Unit=vault-index-worker-reconciliation.service
+
+[Install]
+WantedBy=timers.target

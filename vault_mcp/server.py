@@ -34,7 +34,8 @@ from vault_mcp.ecriture import (
     empreinte_octets,
     reecrire_wikilinks,
 )
-from vault_mcp.index import Index, extraire_wikilinks, repertoire_index
+from vault_mcp import dirty
+from vault_mcp.index import Index, VerrouOccupe, extraire_wikilinks, repertoire_index
 from vault_mcp.mirror_store import MirrorStore
 from vault_mcp.oauth import PORTEE, PORTEE_ECRITURE, PORTEES, FournisseurOAuth
 from vault_mcp.safety import (
@@ -943,6 +944,20 @@ def reindex_note(path: str) -> dict[str, object]:
         return _erreur("ERREUR: index absent, lancer reindex_vault")
     try:
         resultat = _index.reindexer_note(relatif, contenu)
+    except VerrouOccupe:
+        # Un full ou un lot incremental tient le verrou d'ecriture. On ne force
+        # pas : le chemin part dans la file durable et le worker le prendra a la
+        # premiere occasion. Rendre une erreur ferait croire a une perte alors
+        # que rien n'est perdu -- et forcer republierait par-dessus le full.
+        dirty.salir([relatif])
+        return {
+            "etat": "differe",
+            "chemin": relatif,
+            "message": (
+                "un autre writer de l'index est en cours : chemin mis en file, "
+                "indexation au prochain passage du worker"
+            ),
+        }
     except (RuntimeError, ValueError) as exc:
         return _erreur(f"ERREUR: {exc}")
     resultat["message"] = (

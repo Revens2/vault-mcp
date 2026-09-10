@@ -5,6 +5,10 @@ Source : `VAULT_MCP_VAULT` (defaut `/srv/vault-mirror`), le miroir rclone du vau
 Obsidian. C'est la seule source de verite ; CouchDB `vault_rag` est un snapshot mort
 de juin 2026 et n'est plus lu.
 
+Ce full reste la RECONCILIATION ultime du RAG : il est declenche une fois par jour
+par `vault-reindex.timer` (03:30) et a la demande via l'intention `admin/reindex`.
+L'indexation courante, elle, passe par `scripts/index_worker.py` (incremental).
+
 Usage :
     reindex.py            reconstruit l'index
     reindex.py --check    ne reconstruit rien, compare l'index au vault et sort en
@@ -23,50 +27,25 @@ import numpy as np
 
 from vault_mcp.chunk import fragmenter
 from vault_mcp.embed import vectoriser
-from vault_mcp.index import MetaFragment, extraire_wikilinks, repertoire_index, sauvegarder
+from vault_mcp.index import (
+    MetaFragment,
+    VerrouOccupe,
+    extraire_wikilinks,
+    repertoire_index,
+    sauvegarder,
+    verrou_writers,
+)
+from vault_mcp.selection import EXCLUS, FICHIERS_EXCLUS, VAULT_DEFAUT, notes, repertoire_vault
 
-VAULT_DEFAUT = Path("/srv/vault-mirror")
 APERCU_CARACTERES = 240
 LOT = 128
 
-# Repertoires sans valeur semantique : etat local d Obsidian, zones de travail
-# d outils, et les journaux LiveSync (jusqu a 1,3 Mo piece de bruit pur).
-EXCLUS = (
-    ".trash-mcp/",
-    ".obsidian/",
-    ".trash/",
-    ".temp/",
-    ".git/",
-    ".staging/",
-    # Outillage, pas de la connaissance. Indexes par erreur au premier passage :
-    # 5 185 fragments (11,5 % de l index) de configuration d agents et de commandes.
-    ".claude/",
-    ".hermes/",
-    ".mdinbox/",
-)
+# Attente du verrou writer. Un lot incremental dure quelques secondes : attendre
+# est normal. Au-dela, quelque chose est coince et il vaut mieux echouer
+# bruyamment (OnFailure=notify-failure@) que publier en concurrence.
+ATTENTE_VERROU_S = float(os.environ.get("VAULT_MCP_ATTENTE_VERROU_S", "1800"))
 
-# Fichiers generes ou agregats : leur contenu est deja indexe ailleurs, et leur
-# taille leur donne un poids sans rapport avec leur valeur (index.md = 152 fragments).
-FICHIERS_EXCLUS = ("index.md", "log.md")
-
-
-def repertoire_vault() -> Path:
-    return Path(os.environ.get("VAULT_MCP_VAULT", str(VAULT_DEFAUT)))
-
-
-def notes(racine: Path) -> list[Path]:
-    retenues: list[Path] = []
-    for chemin in sorted(racine.rglob("*.md")):
-        relatif = chemin.relative_to(racine).as_posix()
-        nom = Path(relatif).name
-        if (
-            relatif.startswith(EXCLUS)
-            or nom.startswith("livesync_log_")
-            or relatif in FICHIERS_EXCLUS
-        ):
-            continue
-        retenues.append(chemin)
-    return retenues
+__all__ = ["EXCLUS", "FICHIERS_EXCLUS", "VAULT_DEFAUT", "notes", "repertoire_vault"]
 
 
 def construire(racine: Path) -> tuple[np.ndarray, list[MetaFragment], dict[str, list[str]]]:
@@ -150,8 +129,20 @@ def main() -> int:
         return verifier(racine, repertoire)
 
     debut = time.time()
-    vecteurs, metas, backlinks = construire(racine)
-    sauvegarder(repertoire, vecteurs, metas, backlinks)
+    # Le verrou couvre la LECTURE du miroir autant que la publication. Le prendre
+    # seulement au moment de publier laisserait le scenario que l'on veut fermer :
+    # le full lit le miroir a T0, un lot incremental publie N+1 a T0+1 h, le full
+    # publie a T0+2 h un etat calcule sur N -- l'incremental disparait en silence.
+    try:
+        with verrou_writers(repertoire, ATTENTE_VERROU_S):
+            vecteurs, metas, backlinks = construire(racine)
+            sauvegarder(repertoire, vecteurs, metas, backlinks)
+    except VerrouOccupe:
+        print(
+            f"verrou writer non obtenu apres {ATTENTE_VERROU_S:.0f}s : full abandonne",
+            file=sys.stderr,
+        )
+        return 1
     duree = time.time() - debut
     distinctes = len({m.chemin for m in metas})
     print(

@@ -31,7 +31,7 @@ def test_relit_lindex_apres_reindexation(tmp_path: Path) -> None:
     # `sauvegarder` peut s'executer dans la meme seconde que la lecture precedente :
     # on force un mtime distinct pour que le test mesure la logique, pas la resolution
     # de l'horloge du systeme de fichiers.
-    cible = tmp_path / "vectors.npy"
+    cible = tmp_path / "meta.json"
     os.utime(cible, (cible.stat().st_atime, cible.stat().st_mtime + 10))
 
     assert [m.chemin for m in index.metas] == ["apres.md", "autre.md"]

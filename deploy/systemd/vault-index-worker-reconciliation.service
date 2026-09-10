@@ -1,0 +1,49 @@
+[Unit]
+# Meme worker, mode reconciliation. Une unite distincte plutot qu'un drop-in :
+# le .path unit et le timer ne doivent pas se voler mutuellement le job systemd.
+Description=Reconciliation miroir/index et vidange de la file des chemins sales
+After=network-online.target vault-mcp.service
+OnFailure=notify-failure@%n.service
+
+[Service]
+Type=oneshot
+User=juliann-app
+Group=juliann-app
+WorkingDirectory=/opt/vault-mcp
+EnvironmentFile=/opt/vault-mcp/mcp.env
+Environment=PYTHONPATH=/opt/vault-mcp
+Environment=HOME=/opt/vault-mcp
+Environment=VAULT_MCP_THREADS=2
+ExecStart=/opt/vault-mcp/venv/bin/python /opt/vault-mcp/scripts/index_worker.py --reconcilier
+TimeoutStartSec=4h
+StandardInput=null
+Nice=10
+CPUWeight=30
+IOSchedulingClass=idle
+CPUQuota=200%
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+UMask=0007
+ReadWritePaths=/opt/vault-mcp/index /srv/vault-spool/dirty
+ReadOnlyPaths=/srv/vault-mirror
