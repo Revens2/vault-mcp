@@ -13,6 +13,7 @@ Les changements par rapport a la v1 sont volontairement limites a trois points :
 from __future__ import annotations
 
 import os
+import threading
 import time
 
 import uvicorn
@@ -1392,19 +1393,64 @@ def construire_application() -> Application:
     )
 
 
+# Arret borne, en deux etages.
+#
+# Etage 1 : `timeout_graceful_shutdown` borne l attente des CONNEXIONS (flux SSE
+# `GET /mcp`, qui vivent des heures). Sans lui, uvicorn attend leur fin.
+#
+# Etage 2 : le chien de garde. La mesure sur candidat (2026-09-10) a montre que
+# l etage 1 ne suffit PAS : avec un appel d outil SYNCHRONE en vol, l arret dure
+# ~54 s, dont ~53 s passees a fermer le gestionnaire de sessions MCP (lifespan),
+# hors de portee de `timeout_graceful_shutdown`. Les outils du vault sont des
+# fonctions synchrones executees dans un thread : Python ne sait pas les
+# interrompre, donc AUCUN reglage ne peut raccourcir cette attente. Passe le
+# delai, on sort donc en dur.
+#
+# Sortir en dur est sur ICI, et seulement grace a deux proprietes verifiees :
+# le depot d intention (`spool.py`) et le magasin OAuth (`oauth.py`) ecrivent
+# tous deux en `tmp -> fsync -> os.replace -> fsync du repertoire`, donc aucun
+# fichier ne peut rester a moitie ecrit ; et les bases SQLite annulent d elles
+# memes une transaction interrompue. Le vault lui-meme n est jamais ecrit par ce
+# processus : il l est par le pousseur, depuis le spool.
+#
+# Le code de sortie est 0 : l arret est voulu, il ne doit pas declencher la
+# notification `OnFailure` de l unite.
+ARRET_GRACIEUX_S = 5.0
+ARRET_MAXIMUM_S = 10.0
+
+
+def _sortie_bornee(
+    serveur: uvicorn.Server,
+    delai: float = ARRET_MAXIMUM_S,
+    pas: float = 0.1,
+) -> None:
+    """Tue le processus si l arret n a pas abouti dans `delai` secondes."""
+    while not serveur.should_exit:
+        time.sleep(pas)
+    echeance = time.monotonic() + delai
+    while time.monotonic() < echeance:
+        time.sleep(pas)
+    print(
+        f"arret force apres {delai:g} s : un appel d outil synchrone est encore "
+        "en vol, il ne peut pas etre interrompu",
+        flush=True,
+    )
+    os._exit(0)  # noqa: SLF001 -- volontaire : ne pas attendre les threads d outils
+
+
 def main() -> None:
-    # `mcp.run()` ne permet pas d'inserer un middleware : on construit l'application
-    # nous-memes et on la sert directement.
-    # Arret borne : sans limite, uvicorn attend la fin des flux SSE GET /mcp (jusqu a
-    # ~6 000 s observes) et systemd tue le service a TimeoutStopSec (90 s) -> chaque
-    # restart finissait en SIGKILL (7 fois en 14 jours, audit 2026-09-10).
-    uvicorn.run(
+    # `mcp.run()` ne permet pas d'inserer un middleware : on construit
+    # l'application nous-memes et on la sert directement.
+    configuration = uvicorn.Config(
         construire_application(),
         host="127.0.0.1",
         port=PORT,
         log_level="info",
-        timeout_graceful_shutdown=5,
+        timeout_graceful_shutdown=ARRET_GRACIEUX_S,
     )
+    serveur = uvicorn.Server(configuration)
+    threading.Thread(target=_sortie_bornee, args=(serveur,), daemon=True).start()
+    serveur.run()
 
 
 if __name__ == "__main__":
