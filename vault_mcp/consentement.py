@@ -16,7 +16,7 @@ import urllib.parse
 from html import escape
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
@@ -108,8 +108,8 @@ def _rediriger(demande: dict[str, Any], code: str) -> RedirectResponse:
     return RedirectResponse(cible, status_code=302)
 
 
-def enregistrer_routes(mcp: FastMCP, fournisseur: FournisseurOAuth) -> None:
-    """Branche `/consentement` sur l'application FastMCP."""
+def enregistrer_routes(mcp: MCPServer, fournisseur: FournisseurOAuth) -> None:
+    """Branche `/consentement` sur l'application MCP (MCPServer, ex-FastMCP)."""
 
     # `custom_route` n est pas type dans le SDK : mypy considere donc la fonction
     # decoree comme non typee. L ignore porte sur cette limite du SDK, pas sur notre code.
