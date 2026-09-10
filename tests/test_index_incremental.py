@@ -225,6 +225,25 @@ def test_ignorer_laisse_la_note_en_place(tmp_path: Path) -> None:
     index = _index_initial(tmp_path, {"a.md": "alpha", "b.md": "beta"})
     resultat = index.reindexer_chemins(["a.md"], lambda _: IGNORER)
     assert resultat["etat"] == "sans_objet"
+    assert resultat["ignores"] == ["a.md"]
+    assert {m.chemin for m in Index(tmp_path).metas} == {"a.md", "b.md"}
+
+
+def test_un_chemin_illisible_est_signale_sans_bloquer_le_lot(tmp_path: Path) -> None:
+    """Echec partiel : le reste du lot publie, le chemin fautif est rapporte.
+
+    L'appelant doit pouvoir ne PAS l'acquitter : l'acquitter perdrait sa
+    modification jusqu'au full quotidien.
+    """
+    index = _index_initial(tmp_path, {"a.md": "alpha", "b.md": "beta"})
+
+    def lecteur(chemin: str):  # type: ignore[no-untyped-def]
+        return IGNORER if chemin == "a.md" else "# B\ncontenu lisible"
+
+    resultat = index.reindexer_chemins(["a.md", "b.md"], lecteur)
+    assert resultat["etat"] == "applique"
+    assert resultat["ignores"] == ["a.md"]
+    assert resultat["notes"] == 1
     assert {m.chemin for m in Index(tmp_path).metas} == {"a.md", "b.md"}
 
 
@@ -291,6 +310,7 @@ def file_sale(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setenv("VAULT_MCP_DIRTY", str(racine))
     (racine / "queue").mkdir(parents=True)
     (racine / "inflight").mkdir(parents=True)
+    (racine / "differe").mkdir(parents=True)
     return racine
 
 
@@ -335,6 +355,18 @@ def test_rendre_remet_le_lot(file_sale: Path) -> None:
     jeton, _ = dirty.reclamer()
     assert dirty.rendre(jeton) == 1
     assert dirty.taille() == 1
+
+
+def test_un_chemin_differe_nest_pas_repris_par_la_file_surveillee(file_sale: Path) -> None:
+    """`differe/` n'est PAS `queue/` : le `.path` unit ne doit pas le voir.
+
+    Une note durablement illisible remise dans `queue/` ferait boucler le worker.
+    """
+    dirty.differer(["illisible.md"])
+    assert dirty.taille() == 0
+    assert dirty.reprendre_differes() == 1
+    assert dirty.taille() == 1
+    assert dirty.reprendre_differes() == 0
 
 
 def test_le_lot_est_borne(file_sale: Path) -> None:

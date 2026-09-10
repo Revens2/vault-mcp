@@ -304,6 +304,11 @@ def sauvegarder(
     try:
         _ecrire_npy(fichier_vecteurs, vecteurs)
         _ecrire_json(fichier_backlinks, backlinks)
+        # Les DONNEES des deux fichiers sont durables (fsync ci-dessus), mais pas
+        # encore leurs entrees de repertoire. Sans ce fsync, une coupure juste
+        # apres la bascule du manifeste pourrait laisser un manifeste durable qui
+        # designe des fichiers introuvables au redemarrage.
+        _fsync_repertoire(repertoire)
         _ecrire_json(
             tmp_meta,
             {
@@ -610,15 +615,20 @@ class Index:
 
         with verrou_writers(self._repertoire, attente_verrou_s):
             changements: dict[str, str | None] = {}
+            ignores: list[str] = []
             for chemin in dict.fromkeys(chemins):
                 contenu = lecteur(chemin)
                 if contenu is IGNORER:
+                    # Le chemin n'a pas ete traite : l'appelant ne doit pas
+                    # l'acquitter, sinon la modification disparait de la file et
+                    # n'est plus rattrapee que par le full quotidien.
+                    ignores.append(chemin)
                     continue
                 if contenu is not None and not isinstance(contenu, str):
                     raise RuntimeError(f"contenu invalide pour {chemin}")
                 changements[chemin] = contenu
             if not changements:
-                return {"etat": "sans_objet", "notes": 0}
+                return {"etat": "sans_objet", "notes": 0, "ignores": ignores}
 
             self.invalider()
             instantane = self._courant()
@@ -677,6 +687,7 @@ class Index:
         supprimees = sum(1 for contenu in changements.values() if contenu is None)
         return {
             "etat": "applique",
+            "ignores": ignores,
             "notes": len(changements),
             "notes_supprimees": supprimees,
             "chemins": sorted(changements)[:20],

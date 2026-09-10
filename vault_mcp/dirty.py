@@ -50,9 +50,9 @@ def racine() -> Path:
     return Path(os.environ.get("VAULT_MCP_DIRTY", str(RACINE_DEFAUT)))
 
 
-def repertoires() -> tuple[Path, Path]:
+def repertoires() -> tuple[Path, Path, Path]:
     base = racine()
-    return base / "queue", base / "inflight"
+    return base / "queue", base / "inflight", base / "differe"
 
 
 def _nom(chemin: str) -> str:
@@ -79,7 +79,7 @@ def salir(chemins: list[str] | tuple[str, ...] | set[str]) -> int:
     Le temporaire porte un prefixe `.tmp.` : le worker ne reclame que `*.path`,
     il ne peut donc pas s'emparer d'une entree a moitie ecrite.
     """
-    file_attente, _ = repertoires()
+    file_attente, _, _ = repertoires()
     file_attente.mkdir(parents=True, exist_ok=True)
     ecrits = 0
     for chemin in chemins:
@@ -124,7 +124,7 @@ def poser_seuil_reconciliation(horodatage_ns: int) -> None:
 
 
 def taille() -> int:
-    file_attente, _ = repertoires()
+    file_attente, _, _ = repertoires()
     if not file_attente.is_dir():
         return 0
     return sum(1 for f in file_attente.glob("*.path"))
@@ -132,7 +132,7 @@ def taille() -> int:
 
 def recuperer() -> int:
     """Remet dans la file les lots `inflight` orphelins (crash du worker)."""
-    file_attente, vol = repertoires()
+    file_attente, vol, _ = repertoires()
     if not vol.is_dir():
         return 0
     file_attente.mkdir(parents=True, exist_ok=True)
@@ -158,7 +158,7 @@ def reclamer(maximum: int = LOT_MAXIMUM) -> tuple[str, dict[str, Path]]:
 
     Renvoie `(jeton_du_lot, {chemin: fichier_inflight})`. Lot vide -> ("", {}).
     """
-    file_attente, vol = repertoires()
+    file_attente, vol, _ = repertoires()
     if not file_attente.is_dir():
         return "", {}
     candidates = sorted(file_attente.glob("*.path"))[:maximum]
@@ -197,7 +197,7 @@ def acquitter(jeton: str) -> None:
     """Detruit le lot reclame. A n'appeler qu'APRES une publication coherente."""
     if not jeton:
         return
-    _, vol = repertoires()
+    _, vol, _ = repertoires()
     lot = vol / jeton
     if not lot.is_dir():
         return
@@ -209,11 +209,44 @@ def acquitter(jeton: str) -> None:
         pass
 
 
+def differer(chemins: list[str] | tuple[str, ...] | set[str]) -> int:
+    """Range des chemins que le worker n'a PAS pu traiter (note illisible).
+
+    Ils ne sont ni acquittes -- la modification serait perdue jusqu'au full
+    quotidien -- ni remis dans `queue/`, qui est surveille par un `.path` unit :
+    une note durablement illisible y ferait tourner le worker en boucle. Ils sont
+    repris par `reprendre_differes()`, appele par la passe de reconciliation, donc
+    au plus une fois toutes les dix minutes.
+    """
+    _, _, differe = repertoires()
+    differe.mkdir(parents=True, exist_ok=True)
+    ranges = 0
+    for chemin in chemins:
+        if not chemin:
+            continue
+        (differe / _nom(chemin)).write_text(chemin + "\n", encoding="utf-8")
+        ranges += 1
+    return ranges
+
+
+def reprendre_differes() -> int:
+    """Remet les chemins differes dans la file. Appele par la reconciliation."""
+    file_attente, _, differe = repertoires()
+    if not differe.is_dir():
+        return 0
+    file_attente.mkdir(parents=True, exist_ok=True)
+    repris = 0
+    for entree in differe.glob("*.path"):
+        entree.replace(file_attente / entree.name)
+        repris += 1
+    return repris
+
+
 def rendre(jeton: str) -> int:
     """Remet le lot dans la file (echec de traitement). Rejouable."""
     if not jeton:
         return 0
-    file_attente, vol = repertoires()
+    file_attente, vol, _ = repertoires()
     lot = vol / jeton
     if not lot.is_dir():
         return 0
@@ -232,6 +265,8 @@ def rendre(jeton: str) -> int:
 __all__ = [
     "LOT_MAXIMUM",
     "acquitter",
+    "differer",
+    "reprendre_differes",
     "poser_seuil_reconciliation",
     "seuil_reconciliation",
     "racine",

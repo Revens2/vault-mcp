@@ -100,7 +100,10 @@ def ecarts_miroir(index: Index, seuil_ns: int) -> set[str]:
     # passage il n'y a pas de seuil : on ne salit alors que les ecarts d'ensemble,
     # sinon le premier parcours declarerait les 8 500 notes modifiees.
     if seuil_ns:
-        ecarts |= {c for c, date in dans_miroir.items() if date > seuil_ns}
+        # `>=` et non `>` : un fichier dont le ctime tombe exactement sur le seuil
+        # serait sinon invisible. Le cout d'un faux positif est un lot de plus,
+        # celui d'un faux negatif est une note perimee jusqu'au full.
+        ecarts |= {c for c, date in dans_miroir.items() if date >= seuil_ns}
     return ecarts
 
 
@@ -153,8 +156,18 @@ def main() -> int:
         # L'horodatage est pris AVANT le parcours : tout ce qui change pendant le
         # parcours sera vu au parcours suivant, jamais oublie.
         debut_parcours = time.time_ns()
+        repris = dirty.reprendre_differes()
+        if repris:
+            journal(f"chemins differes repris : {repris}")
+        seuil = dirty.seuil_reconciliation()
+        if seuil > debut_parcours:
+            # L'horloge a recule (correction NTP, restauration). Un seuil dans le
+            # futur masquerait toute modification jusqu'a ce que l'horloge le
+            # rattrape : on le desarme et on repart d'une comparaison d'ensembles.
+            journal(f"seuil dans le futur ({seuil} > {debut_parcours}), desarme")
+            seuil = 0
         try:
-            ecarts = ecarts_miroir(index, dirty.seuil_reconciliation())
+            ecarts = ecarts_miroir(index, seuil)
         except OSError as exc:
             journal(f"reconciliation impossible : {exc}")
             ecarts = None
@@ -206,8 +219,16 @@ def main() -> int:
         return 1
 
     dirty.acquitter(jeton)
+    ignores = resultat.get("ignores") or []
+    if ignores:
+        # Acquitter un chemin qu'on n'a pas su lire perdrait sa modification
+        # jusqu'au full quotidien. Il part dans `differe/`, repris par la
+        # prochaine reconciliation -- pas dans `queue/`, surveille par le `.path`
+        # unit, ou une note durablement illisible ferait boucler le worker.
+        dirty.differer(ignores)
+        journal(f"{len(ignores)} chemin(s) illisibles differes, non acquittes")
     if resultat["etat"] == "sans_objet":
-        journal("lot sans effet (toutes les notes illisibles)")
+        journal("lot sans effet (aucune note lisible)")
         return 0
     journal(
         f"publie : {resultat['notes']} note(s) dont {resultat['notes_supprimees']} retiree(s), "
