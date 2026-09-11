@@ -899,3 +899,22 @@ def test_events_ordre_recent_d_abord_et_limite(wj):
     assert len(wj.events(alt["job_id"][:8], limit=1)) == 1
     for e in ev:
         assert COURT not in (e["detail"] or "")  # jamais de contenu documentaire
+
+
+# ------------------------------------------------------- surface MCP (wrappers)
+def test_release_alternate_via_le_wrapper_mcp(wj):
+    # Chemin exact du consommateur ChatGPT : wiki_ingest_release -> convia_mcp.wiki_release.
+    from vault_mcp import convia_mcp
+    importlib.reload(convia_mcp)
+    wj.sync_source("raw/a.md", "a" * 64, COURT)
+    job = convia_mcp.wiki_claim(limit=1)["jobs"][0]
+    res = convia_mcp.wiki_release(job["job_id"], job["lease_id"], "alternate",
+                                  "SKIPPED_SAFETY: lecture documentaire bloquee par la plateforme")
+    assert res["status"] == wj.ALT_PENDING and res["attempts"] == 0
+    row = _row(wj, job["job_id"])
+    assert row["status"] == wj.ALT_PENDING and row["attempts"] == 0 and row["lease_id"] is None
+    assert row["alt_reason"].startswith("SKIPPED_SAFETY")
+    assert wj.ALTERNATE_REQUEST.exists()
+    assert convia_mcp.wiki_claim(limit=10)["jobs"] == []
+    with pytest.raises(convia_mcp.ConviaError, match="action inconnue"):
+        convia_mcp.wiki_release(job["job_id"], "x", "teleporter", "")
