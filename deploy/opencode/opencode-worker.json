@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "autoupdate": false,
+  "share": "disabled",
+  "snapshot": false,
+  "mcp": {},
+  "permission": {"*": "deny"},
+  "agent": {
+    "extract": {
+      "mode": "primary",
+      "description": "Extraction Wiki d'une archive documentaire, sans aucun outil",
+      "prompt": "{file:/etc/llm-wiki/opencode-wiki-extract.md}",
+      "permission": {"*": "deny"}
+    }
+  }
+}

@@ -1,0 +1,13 @@
+# Rattrapage : un marqueur perdu, un backoff provider echu ou un bail alternatif
+# expire ne doivent jamais laisser la file bloquee. Peu frequent, a dessein.
+[Unit]
+Description=Rattrapage du worker alternatif LLM Wiki
+
+[Timer]
+OnCalendar=*-*-* 00/2:45:00
+RandomizedDelaySec=5min
+Persistent=true
+Unit=llm-wiki-opencode.service
+
+[Install]
+WantedBy=timers.target

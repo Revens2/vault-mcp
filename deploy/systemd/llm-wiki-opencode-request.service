@@ -1,0 +1,9 @@
+# Retire le marqueur PUIS demarre le worker (--no-block) : une demande deposee
+# pendant le traitement rearme le .path au lieu d'etre perdue.
+[Unit]
+Description=Demarrage du worker alternatif LLM Wiki sur demande
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/rm -f /var/lib/vault-mcp/wiki-alternate.request
+ExecStart=/usr/bin/systemctl start --no-block llm-wiki-opencode.service

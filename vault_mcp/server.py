@@ -1317,8 +1317,10 @@ def wiki_ingest_submit(job_id: str, lease_id: str, fencing_token: int,
 def wiki_ingest_release(job_id: str, lease_id: str, action: str = "release",
                         reason: str = "") -> dict[str, object]:
     """Voluntarily release a lease: `release` (back to pending), `defer`
-    (pending with backoff counting towards quarantine), or bounded `renew`.
-    Requires `mcp:ecriture`.
+    (pending with backoff counting towards quarantine), bounded `renew`, or
+    `alternate` (the platform blocks reading/analysing this document, e.g.
+    SKIPPED_SAFETY: the job leaves the ChatGPT queue for the local alternate
+    worker, no attempt is consumed; give the reason). Requires `mcp:ecriture`.
     """
     refus = _exiger_ecriture()
     if refus:

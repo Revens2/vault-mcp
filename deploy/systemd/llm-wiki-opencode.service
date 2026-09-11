@@ -1,0 +1,66 @@
+# Worker alternatif de la file Wiki (route `alternate`) : OpenCode + Muse Spark.
+# Oneshot borne : un lot puis sortie. Declenche par llm-wiki-opencode-request.path
+# (marqueur depose par vault-mcp) et par llm-wiki-opencode.timer (rattrapage).
+#
+# Compte juliann-app : seul proprietaire de wiki_jobs.db. Tout le reste est ferme :
+# code vault-mcp visible SANS mcp.env ni oauth (tmpfs + binds), convia.db masquee,
+# wiki en lecture seule (il n'ecrit jamais une fiche : submit -> spool -> fusion).
+[Unit]
+Description=Worker alternatif LLM Wiki (OpenCode, route alternate)
+After=network-online.target
+Wants=network-online.target
+OnFailure=notify-failure@%n.service
+
+[Service]
+Type=oneshot
+User=juliann-app
+Group=juliann-app
+SupplementaryGroups=llmwiki llmspool
+EnvironmentFile=/etc/llm-wiki/opencode-worker.env
+Environment=HOME=/var/lib/llm-wiki-opencode
+Environment=PYTHONDONTWRITEBYTECODE=1
+# Le paquet vault_mcp n'est pas installe dans le venv : vault-mcp le trouve par son
+# WorkingDirectory. Ici le cwd est l'etat du worker, d'ou PYTHONPATH explicite.
+Environment=PYTHONPATH=/opt/vault-mcp
+# Memes chemins que vault-mcp (vault-mcp.service.d/80-wiki-contract.conf) : un seul
+# manifeste, un seul contrat, un seul wiki de reference. A garder synchronises.
+Environment=WIKI_JOBS_MANIFEST=/var/lib/vault-mcp/wiki_jobs_manifest.jsonl
+Environment=WIKI_CONTRACT_MODULE=/usr/local/bin/llm_wiki_extract.py
+Environment=WIKI_NOTES_DIR=/srv/obsidian-vault/wiki
+WorkingDirectory=/var/lib/llm-wiki-opencode
+ExecStart=/opt/vault-mcp/venv/bin/python -m vault_mcp.wiki_alternate --batch 3 --max-seconds 2400
+StateDirectory=llm-wiki-opencode
+StateDirectoryMode=0700
+TimeoutStartSec=50min
+StandardInput=null
+UMask=0077
+Nice=10
+MemoryMax=2G
+
+# --- bac a sable
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectProc=invisible
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+TemporaryFileSystem=/opt/vault-mcp:ro
+BindReadOnlyPaths=/opt/vault-mcp/venv /opt/vault-mcp/vault_mcp
+InaccessiblePaths=-/var/lib/vault-mcp/convia.db
+ReadWritePaths=/var/lib/vault-mcp /var/lib/llm-wiki/spool/extract /var/lib/llm-wiki/notify-spool
+ReadOnlyPaths=/srv/obsidian-vault

@@ -1,0 +1,12 @@
+# Reveil du worker alternatif : vault-mcp depose ce marqueur quand un job passe
+# en route `alternate` (wiki_ingest_release action=alternate). Meme separation que
+# llm-wiki-ingest-request.path : le service expose depose, root applique.
+[Unit]
+Description=Demande de traitement alternatif LLM Wiki deposee par vault-mcp
+
+[Path]
+PathExists=/var/lib/vault-mcp/wiki-alternate.request
+Unit=llm-wiki-opencode-request.service
+
+[Install]
+WantedBy=multi-user.target

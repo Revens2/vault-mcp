@@ -22,6 +22,14 @@ Poison pills : pending -> leased -> submitted -> merged nominal ;
 leased -> deferred -> pending sur echec transitoire ; apres MAX_ATTEMPTS (3)
 -> quarantined avec {raison, attempts, timestamps, derniere erreur compacte}.
 Une erreur d'un job n'arrete jamais les autres.
+
+Route alternative (worker local OpenCode) : un blocage de plateforme cote
+ChatGPT fait `release(action="alternate")` : leased -> alternate_pending, sans
+consommer de tentative ChatGPT ; le job sort du claim normal. Le worker fait
+claim_alternate -> alternate_leased -> submit (meme validation, meme spool, meme
+merge). Reponse invalide : attempts_alternate+1, 3 -> alternate_quarantined.
+Panne provider : retour alternate_pending avec backoff, rien de consomme.
+Chaque transition hors nominal laisse une ligne dans wiki_job_events.
 """
 
 from __future__ import annotations
@@ -113,7 +121,44 @@ CREATE TABLE IF NOT EXISTS wiki_jobs (
 );
 CREATE INDEX IF NOT EXISTS idx_wiki_jobs_status ON wiki_jobs (status, created_at);
 CREATE INDEX IF NOT EXISTS idx_wiki_jobs_source ON wiki_jobs (source, source_hash);
+CREATE TABLE IF NOT EXISTS wiki_job_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id          TEXT NOT NULL,
+    at              TEXT NOT NULL,
+    actor           TEXT NOT NULL,
+    event           TEXT NOT NULL,
+    from_status     TEXT,
+    to_status       TEXT,
+    attempts_before INTEGER,
+    last_error      TEXT,
+    detail          TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wiki_job_events_job ON wiki_job_events (job_id, id);
 """
+
+# Colonnes ajoutees apres coup : ALTER TABLE ADD COLUMN idempotent, lisible par
+# l'ancien code (qui ne les nomme jamais) pendant une bascule.
+# Requetes litterales (aucune composition de SQL).
+_ADDED_COLUMNS = (
+    ("route", "ALTER TABLE wiki_jobs ADD COLUMN route TEXT"),
+    ("attempts_alternate",
+     "ALTER TABLE wiki_jobs ADD COLUMN attempts_alternate INTEGER NOT NULL DEFAULT 0"),
+    ("provider_failures",
+     "ALTER TABLE wiki_jobs ADD COLUMN provider_failures INTEGER NOT NULL DEFAULT 0"),
+    ("alt_next_at", "ALTER TABLE wiki_jobs ADD COLUMN alt_next_at INTEGER"),
+    ("alt_reason", "ALTER TABLE wiki_jobs ADD COLUMN alt_reason TEXT"),
+    ("model", "ALTER TABLE wiki_jobs ADD COLUMN model TEXT"),
+)
+
+ALT_PENDING = "alternate_pending"
+ALT_LEASED = "alternate_leased"
+ALT_QUARANTINED = "alternate_quarantined"
+TERMINAL_SKIP = "terminal_skip"
+MAX_ALT_ATTEMPTS = 3
+# Marqueur de reveil du worker alternatif, meme principe que INGEST_REQUEST
+# (convia_mcp) : le service expose depose, une unite .path lance le worker.
+ALTERNATE_REQUEST = Path(os.environ.get(
+    "WIKI_ALTERNATE_REQUEST", "/var/lib/vault-mcp/wiki-alternate.request"))
 
 
 def _now_iso() -> str:
@@ -124,13 +169,48 @@ def _now_ts() -> int:
     return int(time.time())
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    have = {r[1] for r in conn.execute("PRAGMA table_info(wiki_jobs)")}
+    for name, ddl in _ADDED_COLUMNS:
+        if name not in have:
+            try:
+                conn.execute(ddl)
+            except sqlite3.OperationalError as exc:
+                # Deux connexions migrent en meme temps : la seconde perd, sans gravite.
+                if "duplicate column" not in str(exc):
+                    raise
+    conn.commit()
+
+
 def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _event(conn: sqlite3.Connection, row: sqlite3.Row, event: str, to_status: str,
+           actor: str, detail: str = "") -> None:
+    """Journal append-only des transitions hors nominal. Jamais de contenu documentaire."""
+    conn.execute(
+        "INSERT INTO wiki_job_events (job_id, at, actor, event, from_status, to_status,"
+        " attempts_before, last_error, detail) VALUES (?,?,?,?,?,?,?,?,?)",
+        (row["job_id"], _now_iso(), actor[:40], event, row["status"], to_status,
+         int(row["attempts"] or 0), (row["last_error"] or "")[:300], detail[:300]))
+
+
+def _requeue_status(row: sqlite3.Row) -> str:
+    """File d'origine d'un job dont le bail expire : jamais de fuite d'une route a l'autre."""
+    return ALT_PENDING if row["status"] == ALT_LEASED else "pending"
+
+
+def _touch_alternate_request() -> None:
+    with contextlib.suppress(OSError):
+        ALTERNATE_REQUEST.parent.mkdir(parents=True, exist_ok=True)
+        ALTERNATE_REQUEST.touch()
 
 
 # ------------------------------------------------------------ tokenizer local
@@ -258,7 +338,7 @@ def sync_source(source: str, source_hash: str, content: str,
             " lease_id=NULL, expires_at=NULL,"
             " last_error='stale: source modifiee, nouvelle version en file',"
             " updated_at=? WHERE source=? AND source_hash!=? AND contract_version=?"
-            " AND status IN ('pending','leased','deferred')",
+            " AND status IN ('pending','leased','deferred','alternate_pending','alternate_leased')",
             (now, source, source_hash, CONTRACT_VERSION),
         )
         stale = cur.rowcount or 0
@@ -408,15 +488,17 @@ def read_job(job_id: str, lease_id: str) -> dict[str, object]:
             raise WikiJobsError("job inconnu")
         if not lease_id or row["lease_id"] != lease_id:
             raise WikiJobsError("lease-invalid : bail inconnu ou reattribue")
+        # Statut AVANT expiration : un job soumis garde son lease_id (rejeu
+        # idempotent) ; le relire apres expiration ne doit jamais le remettre en file.
+        if row["status"] not in ("leased", ALT_LEASED):
+            raise WikiJobsError(f"job non loue (status={row['status']})")
         if int(row["expires_at"] or 0) < _now_ts():
             conn.execute(
-                "UPDATE wiki_jobs SET status='pending', lease_id=NULL,"
+                "UPDATE wiki_jobs SET status=?, lease_id=NULL,"
                 " expires_at=NULL, updated_at=? WHERE job_id=?",
-                (_now_iso(), job_id))
+                (_requeue_status(row), _now_iso(), job_id))
             conn.commit()
             raise WikiJobsError("lease-expired : bail expire, job remis en file")
-        if row["status"] != "leased":
-            raise WikiJobsError(f"job non loue (status={row['status']})")
         return {
             "job_id": row["job_id"],
             "source": row["source"],
@@ -886,8 +968,11 @@ def _write_atomic_json(path: Path, obj: dict) -> None:
 # ------------------------------------------------------------------ submit
 def submit(job_id: str, lease_id: str, fencing_token: int,
            contract_version: str, extraction: dict,
-           contract_digest: str = "") -> dict[str, object]:
+           contract_digest: str = "", model: str = "chatgpt") -> dict[str, object]:
     """Soumission idempotente + spool immediat si valide.
+
+    Chemin unique des deux routes : un job `alternate_leased` passe exactement
+    par les memes controles ; seul `model` (trace dans l'enveloppe) differe.
 
     Refus sans effet sur le job (ni tentative consommee, ni bail touche) :
     version inconnue, contrat indisponible, digest perime.
@@ -923,7 +1008,8 @@ def submit(job_id: str, lease_id: str, fencing_token: int,
             " AND source_hash!=? AND contract_version=? AND rowid > ?",
             (row["source"], row["source_hash"], CONTRACT_VERSION,
              int(cur_rowid["rowid"]))).fetchone()
-        if int(newer["n"] or 0) > 0 and row["status"] in ("leased", "pending", "deferred"):
+        if int(newer["n"] or 0) > 0 and row["status"] in (
+                "leased", "pending", "deferred", ALT_PENDING, ALT_LEASED):
             conn.execute(
                 "UPDATE wiki_jobs SET status='deferred', attempts=attempts+1,"
                 " lease_id=NULL, expires_at=NULL,"
@@ -952,14 +1038,14 @@ def submit(job_id: str, lease_id: str, fencing_token: int,
             raise WikiJobsError("lease-invalid : bail inconnu ou reattribue")
         if int(row["expires_at"] or 0) < _now_ts():
             conn.execute(
-                "UPDATE wiki_jobs SET status='pending', lease_id=NULL,"
+                "UPDATE wiki_jobs SET status=?, lease_id=NULL,"
                 " expires_at=NULL, updated_at=? WHERE job_id=?",
-                (_now_iso(), job_id))
+                (_requeue_status(row), _now_iso(), job_id))
             conn.commit()
             raise WikiJobsError("lease-expired : bail expire, job remis en file")
         if int(fencing_token or 0) != int(row["fencing_token"] or 0):
             raise WikiJobsError("fencing-mismatch : attribution plus recente existe")
-        if row["status"] != "leased":
+        if row["status"] not in ("leased", ALT_LEASED):
             raise WikiJobsError(f"job non loue (status={row['status']})")
 
         ok, errs, warns, norm = _validate_all(extraction, row["source"])
@@ -969,6 +1055,19 @@ def submit(job_id: str, lease_id: str, fencing_token: int,
                 ok = False
                 errs = [f"note.slug {norm['note']['slug']!r} deja porte par une autre"
                         f" source : {collision} ; choisir un slug distinct"]
+        if not ok and row["status"] == ALT_LEASED:
+            # Route alternative : budget propre, jamais celui de ChatGPT, et retour
+            # dans SA file (jamais `pending`, que ChatGPT reclamerait).
+            att = int(row["attempts_alternate"] or 0) + 1
+            to = ALT_QUARANTINED if att >= MAX_ALT_ATTEMPTS else ALT_PENDING
+            why = "; ".join(errs)[:280]
+            _event(conn, row, "alternate-invalid", to, "submit", why)
+            conn.execute(
+                "UPDATE wiki_jobs SET status=?, attempts_alternate=?, last_error=?,"
+                " lease_id=NULL, expires_at=NULL, updated_at=? WHERE job_id=?",
+                (to, att, f"alternate: {why}", _now_iso(), job_id))
+            conn.commit()
+            raise WikiJobsError(f"validation refusee : {why}")
         if not ok:
             att = int(row["attempts"] or 0) + 1
             status = "quarantined" if att >= MAX_ATTEMPTS else "deferred"
@@ -996,7 +1095,7 @@ def submit(job_id: str, lease_id: str, fencing_token: int,
                        "chunk": {"index": row["chunk_index"],
                                  "total": row["chunk_count"]},
                        "chunk_hash": row["chunk_hash"]},
-            "extraction": {"model": "chatgpt", "extracted_at": _now_iso(),
+            "extraction": {"model": str(model or "chatgpt")[:80], "extracted_at": _now_iso(),
                            "confidence": norm.get("confidence", 0.0),
                            "language": norm.get("language") or "fr",
                            "usage": {}, "validation_warnings": warns},
@@ -1007,10 +1106,13 @@ def submit(job_id: str, lease_id: str, fencing_token: int,
         }
         _write_atomic_json(_spool_path(row["source_hash"], int(row["chunk_index"])),
                            envelope)
+        if row["status"] == ALT_LEASED:
+            _event(conn, row, "alternate-submitted", "submitted", "submit",
+                   f"receipt {receipt} model {str(model or '')[:60]}")
         conn.execute(
             "UPDATE wiki_jobs SET status='submitted', payload_hash=?,"
-            " receipt_id=?, last_error=NULL, updated_at=? WHERE job_id=?",
-            (ph, receipt, _now_iso(), job_id))
+            " receipt_id=?, model=?, last_error=NULL, updated_at=? WHERE job_id=?",
+            (ph, receipt, str(model or "chatgpt")[:80], _now_iso(), job_id))
         conn.commit()
         return {"receipt_id": receipt, "job_id": job_id,
                 "warnings": warns, "duplicate": False}
@@ -1021,8 +1123,8 @@ def submit(job_id: str, lease_id: str, fencing_token: int,
 # ------------------------------------------------------------------ release
 def release(job_id: str, lease_id: str, action: str = "release",
             reason: str = "") -> dict[str, object]:
-    if action not in ("release", "defer", "renew"):
-        raise WikiJobsError("action inconnue (release|defer|renew)")
+    if action not in ("release", "defer", "renew", "alternate"):
+        raise WikiJobsError("action inconnue (release|defer|renew|alternate)")
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -1038,6 +1140,28 @@ def release(job_id: str, lease_id: str, action: str = "release",
         if row["status"] != "leased":
             raise WikiJobsError(f"job non loue (status={row['status']}) : rien a liberer")
         now = _now_iso()
+        if action == "alternate":
+            # Blocage de plateforme cote consommateur : ce n'est pas une faute du
+            # document, aucune tentative ChatGPT n'est consommee. Le job quitte la
+            # file ChatGPT (claim ne voit que pending/deferred/leased).
+            why = (reason or "alternate").strip()[:300]
+            # Route alternative deja epuisee (3 echecs, puis remise en file ChatGPT par
+            # l'admin) : pas de job fantome invisible des deux claims -> quarantaine.
+            to = (ALT_QUARANTINED if int(row["attempts_alternate"] or 0) >= MAX_ALT_ATTEMPTS
+                  else ALT_PENDING)
+            _event(conn, row, "route-alternate", to, "release", why)
+            conn.execute(
+                "UPDATE wiki_jobs SET status=?, route='alternate', alt_reason=?,"
+                " alt_next_at=NULL, lease_id=NULL, expires_at=NULL, last_error=?,"
+                " updated_at=? WHERE job_id=?",
+                (to, why, why if to == ALT_PENDING
+                 else f"alternate quarantine: route alternative epuisee ; {why}"[:300],
+                 now, job_id))
+            conn.commit()
+            if to == ALT_PENDING:
+                _touch_alternate_request()
+            return {"status": to, "job_id": job_id,
+                    "attempts": int(row["attempts"] or 0)}
         if action == "release":
             conn.execute(
                 "UPDATE wiki_jobs SET status='pending', lease_id=NULL,"
@@ -1084,6 +1208,295 @@ def release(job_id: str, lease_id: str, action: str = "release",
         conn.close()
 
 
+# ------------------------------------------------------- route alternative
+def claim_alternate(lease_seconds: int = DEFAULT_LEASE_S,
+                    actor: str = "opencode") -> dict[str, object] | None:
+    """Reserve UN job de la route alternative, ou None si rien n'est eligible.
+
+    Eligible : alternate_pending au backoff echu, ou alternate_leased au bail
+    expire (detenteur mort, aucun reaper par conception, comme claim()). Meme
+    fencing monotone : l'ancien detenteur ne peut plus rien soumettre.
+    """
+    digest = _contract_digest()
+    lease_seconds = max(60, min(int(lease_seconds or DEFAULT_LEASE_S), 86400))
+    now = _now_ts()
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT * FROM wiki_jobs WHERE contract_version=? AND attempts_alternate < ?"
+            " AND ((status=? AND (alt_next_at IS NULL OR alt_next_at <= ?))"
+            "      OR (status=? AND expires_at IS NOT NULL AND expires_at < ?))"
+            " ORDER BY updated_at ASC LIMIT 1",
+            (CONTRACT_VERSION, MAX_ALT_ATTEMPTS, ALT_PENDING, now, ALT_LEASED, now),
+        ).fetchone()
+        if row is None:
+            conn.commit()
+            return None
+        if row["status"] == ALT_LEASED:
+            _event(conn, row, "alternate-lease-expired", ALT_LEASED, actor,
+                   "bail alternatif expire, reattribue")
+        lease_id = uuid.uuid4().hex[:16]
+        fencing = int(row["fencing_token"] or 0) + 1
+        expires = now + lease_seconds
+        cur = conn.execute(
+            "UPDATE wiki_jobs SET status=?, lease_id=?, fencing_token=?, expires_at=?,"
+            " renews=0, updated_at=? WHERE job_id=? AND fencing_token=?"
+            " AND status IN (?,?)",
+            (ALT_LEASED, lease_id, fencing, expires, _now_iso(), row["job_id"],
+             int(row["fencing_token"] or 0), ALT_PENDING, ALT_LEASED))
+        if cur.rowcount != 1:
+            conn.commit()
+            return None
+        conn.commit()
+        return {
+            "job_id": row["job_id"], "lease_id": lease_id, "fencing_token": fencing,
+            "source": row["source"], "source_hash": row["source_hash"],
+            "chunk_index": row["chunk_index"], "chunk_count": row["chunk_count"],
+            "chunk_hash": row["chunk_hash"], "chunk_bytes": int(row["chunk_bytes"] or 0),
+            "contract_version": row["contract_version"], "contract_digest": digest,
+            "attempts_alternate": int(row["attempts_alternate"] or 0),
+            "alt_reason": row["alt_reason"] or "",
+            "expires_at": datetime.fromtimestamp(expires, UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
+    finally:
+        conn.close()
+
+
+def _alt_row(conn: sqlite3.Connection, job_id: str, lease_id: str,
+             fencing_token: int) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM wiki_jobs WHERE job_id=?", (job_id,)).fetchone()
+    if row is None:
+        raise WikiJobsError("job inconnu")
+    if row["status"] != ALT_LEASED or not lease_id or row["lease_id"] != lease_id:
+        raise WikiJobsError("lease-invalid : bail alternatif inconnu ou reattribue")
+    if int(fencing_token or 0) != int(row["fencing_token"] or 0):
+        raise WikiJobsError("fencing-mismatch : attribution plus recente existe")
+    return row
+
+
+def check_extraction(job_id: str, lease_id: str, fencing_token: int,
+                     extraction: object) -> dict[str, object]:
+    """Validation A BLANC d'une reponse alternative : memes validateurs et meme garde
+    de slug que submit, sans aucun effet sur le job. Permet de rendre au modele les
+    erreurs exactes avant de consommer une tentative ; submit re-valide de toute facon."""
+    conn = connect()
+    try:
+        row = _alt_row(conn, job_id, lease_id, fencing_token)
+    finally:
+        conn.close()
+    if not isinstance(extraction, dict):
+        return {"ok": False, "errors": ["extraction non-objet"], "warnings": []}
+    ok, errs, warns, norm = _validate_all(copy.deepcopy(extraction), row["source"])
+    if ok:
+        collision = _slug_collision(str(norm["note"]["slug"]), row["source"])
+        if collision:
+            ok, errs = False, [f"note.slug {norm['note']['slug']!r} deja porte par une autre"
+                               f" source : {collision} ; choisir un slug distinct"]
+    return {"ok": ok, "errors": errs, "warnings": warns}
+
+
+def record_alternate_failure(job_id: str, lease_id: str, fencing_token: int,
+                             errors: list[str], actor: str = "opencode") -> dict[str, object]:
+    """Reponse du modele inexploitable (JSON invalide, contrat refuse...) : faute propre
+    au document. attempts_alternate+1, persiste AVANT la tentative suivante (un crash
+    ne remet pas le compteur a zero). Seuil -> alternate_quarantined, bail ferme."""
+    why = "; ".join(str(e) for e in errors)[:280] or "reponse invalide"
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _alt_row(conn, job_id, lease_id, fencing_token)
+        att = int(row["attempts_alternate"] or 0) + 1
+        if att >= MAX_ALT_ATTEMPTS:
+            _event(conn, row, "alternate-quarantined", ALT_QUARANTINED, actor, why)
+            conn.execute(
+                "UPDATE wiki_jobs SET status=?, attempts_alternate=?, last_error=?,"
+                " lease_id=NULL, expires_at=NULL, updated_at=? WHERE job_id=?",
+                (ALT_QUARANTINED, att, f"alternate quarantine: {why}", _now_iso(), job_id))
+            status_ = ALT_QUARANTINED
+        else:
+            _event(conn, row, "alternate-invalid", ALT_LEASED, actor, why)
+            conn.execute(
+                "UPDATE wiki_jobs SET attempts_alternate=?, last_error=?, updated_at=?"
+                " WHERE job_id=?", (att, f"alternate: {why}", _now_iso(), job_id))
+            status_ = ALT_LEASED
+        conn.commit()
+        return {"status": status_, "attempts_alternate": att, "job_id": job_id}
+    finally:
+        conn.close()
+
+
+def release_alternate(job_id: str, lease_id: str, fencing_token: int, detail: str,
+                      backoff_s: int = 0, provider: bool = True,
+                      actor: str = "opencode",
+                      max_provider_failures: int = 0) -> dict[str, object]:
+    """Panne provider/infra (ou arret propre) : rend le job a SA file, sans consommer
+    aucune tentative de contenu. `backoff_s` retarde sa reeligibilite.
+
+    `max_provider_failures` : garde-fou contre une boucle infinie (un document qui
+    ferait echouer le provider a chaque fois) ; atteint -> alternate_quarantined.
+    """
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = _alt_row(conn, job_id, lease_id, fencing_token)
+        pf = int(row["provider_failures"] or 0) + (1 if provider else 0)
+        if provider and max_provider_failures and pf >= max_provider_failures:
+            why = f"pannes provider repetees ({pf}) : {detail}"[:280]
+            _event(conn, row, "alternate-quarantined", ALT_QUARANTINED, actor, why)
+            conn.execute(
+                "UPDATE wiki_jobs SET status=?, provider_failures=?, last_error=?,"
+                " lease_id=NULL, expires_at=NULL, updated_at=? WHERE job_id=?",
+                (ALT_QUARANTINED, pf, f"alternate quarantine: {why}", _now_iso(), job_id))
+            conn.commit()
+            return {"status": ALT_QUARANTINED, "job_id": job_id, "provider_failures": pf}
+        nxt = _now_ts() + max(0, int(backoff_s or 0)) if backoff_s else None
+        _event(conn, row, "alternate-provider" if provider else "alternate-release",
+               ALT_PENDING, actor, detail)
+        conn.execute(
+            "UPDATE wiki_jobs SET status=?, lease_id=NULL, expires_at=NULL, alt_next_at=?,"
+            " provider_failures=provider_failures+?, updated_at=? WHERE job_id=?",
+            (ALT_PENDING, nxt, 1 if provider else 0, _now_iso(), job_id))
+        conn.commit()
+        return {"status": ALT_PENDING, "job_id": job_id, "alt_next_at": nxt,
+                "provider_failures": pf}
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------------ administration
+_REQUEUE_TARGETS = {"pending": "pending", "alternate": ALT_PENDING}
+_REQUEUABLE = ("quarantined", ALT_QUARANTINED)
+
+
+def _select_admin(conn: sqlite3.Connection, job_ids: list[str] | None,
+                  reason_like: str | None, statuses: tuple[str, ...],
+                  limit: int) -> list[sqlite3.Row]:
+    if not job_ids and not reason_like:
+        raise WikiJobsError("filtre obligatoire : job_id(s) ou motif de raison")
+    prefixes = []
+    for j in job_ids or []:
+        j = j.strip()
+        if len(j) < 8 or not re.fullmatch(r"[0-9a-f]+", j):
+            raise WikiJobsError(f"job_id invalide (8 hex minimum) : {j!r}")
+        prefixes.append(j)
+    # Requete fixe, filtres en Python : les quarantaines sont peu nombreuses et
+    # aucun SQL n'est compose a partir d'une entree.
+    rows = conn.execute(
+        "SELECT * FROM wiki_jobs WHERE status IN (?,?) ORDER BY created_at ASC",
+        (statuses + statuses)[:2]).fetchall()
+    out = [r for r in rows
+           if (not prefixes or any(r["job_id"].startswith(p) for p in prefixes))
+           and (not reason_like
+                or reason_like.casefold() in (r["last_error"] or "").casefold())]
+    return out[:max(1, min(int(limit or 1), 500))]
+
+
+def _admin_line(r: sqlite3.Row, to: str) -> dict[str, object]:
+    return {"job_id": r["job_id"], "source": r["source"].rsplit("/", 1)[-1][:80],
+            "status": r["status"], "attempts": int(r["attempts"] or 0),
+            "attempts_alternate": int(r["attempts_alternate"] or 0),
+            "last_error": (r["last_error"] or "")[:120], "to": to}
+
+
+def requeue(job_ids: list[str] | None = None, reason_like: str | None = None,
+            limit: int = 50, dry_run: bool = True, cause: str = "",
+            target: str = "pending", actor: str = "admin") -> dict[str, object]:
+    """Remise en file controlee de quarantaines dont la cause est reparee.
+
+    Filtre obligatoire (job_id explicite ou motif de raison), lot borne, dry-run par
+    defaut. Ne perd rien : ancienne raison, ancien nombre de tentatives, date et cause
+    vont dans wiki_job_events avant la remise a zero du budget de la file cible.
+    Idempotent : un job deja remis en file n'est plus `quarantined`, donc plus eligible.
+    Une source modifiee depuis (version plus recente en file) n'est jamais relancee.
+    """
+    if target not in _REQUEUE_TARGETS:
+        raise WikiJobsError("target inconnue (pending|alternate)")
+    if not dry_run and not cause.strip():
+        raise WikiJobsError("cause obligatoire hors dry-run")
+    to = _REQUEUE_TARGETS[target]
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = _select_admin(conn, job_ids, reason_like, _REQUEUABLE, limit)
+        done, skipped = [], []
+        for r in rows:
+            newer = conn.execute(
+                "SELECT COUNT(*) n FROM wiki_jobs WHERE source=? AND source_hash!=?"
+                " AND contract_version=? AND rowid > (SELECT rowid FROM wiki_jobs"
+                " WHERE job_id=?)", (r["source"], r["source_hash"], CONTRACT_VERSION,
+                                     r["job_id"])).fetchone()
+            if int(newer["n"] or 0) > 0:
+                skipped.append({**_admin_line(r, to), "skip": "source modifiee depuis"})
+                continue
+            if dry_run:
+                done.append(_admin_line(r, to))
+                continue
+            _event(conn, r, f"requeue-{target}", to, actor, cause.strip())
+            if target == "pending":
+                cur = conn.execute(
+                    "UPDATE wiki_jobs SET status='pending', attempts=0, lease_id=NULL,"
+                    " expires_at=NULL, last_error=?, updated_at=? WHERE job_id=? AND status=?",
+                    (f"requeue: {cause.strip()}"[:300], _now_iso(), r["job_id"], r["status"]))
+            else:
+                cur = conn.execute(
+                    "UPDATE wiki_jobs SET status=?, route='alternate', attempts_alternate=0,"
+                    " provider_failures=0, alt_next_at=NULL, alt_reason=?, lease_id=NULL,"
+                    " expires_at=NULL,"
+                    " last_error=?, updated_at=? WHERE job_id=? AND status=?",
+                    (ALT_PENDING, (r["last_error"] or cause)[:300],
+                     f"requeue: {cause.strip()}"[:300], _now_iso(), r["job_id"], r["status"]))
+            if cur.rowcount == 1:
+                done.append(_admin_line(r, to))
+        conn.commit()
+    finally:
+        conn.close()
+    if done and not dry_run and target == "alternate":
+        _touch_alternate_request()
+    return {"dry_run": dry_run, "target": to, "count": len(done), "jobs": done,
+            "skipped": skipped}
+
+
+def terminal_skip(job_ids: list[str], cause: str, dry_run: bool = True,
+                  actor: str = "admin") -> dict[str, object]:
+    """Source reellement vide/inutile : sortie definitive des files, jamais re-reclamee
+    (claim et claim_alternate ne voient que des listes blanches de statuts). Job_id
+    explicite uniquement ; audit comme requeue."""
+    if not job_ids:
+        raise WikiJobsError("job_id(s) obligatoire(s)")
+    if not dry_run and not cause.strip():
+        raise WikiJobsError("cause obligatoire hors dry-run")
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = _select_admin(conn, job_ids, None, _REQUEUABLE, len(job_ids))
+        done = []
+        for r in rows:
+            if not dry_run:
+                _event(conn, r, "terminal-skip", TERMINAL_SKIP, actor, cause.strip())
+                conn.execute(
+                    "UPDATE wiki_jobs SET status=?, lease_id=NULL, expires_at=NULL,"
+                    " last_error=?, updated_at=? WHERE job_id=? AND status=?",
+                    (TERMINAL_SKIP, f"terminal_skip: {cause.strip()}"[:300], _now_iso(),
+                     r["job_id"], r["status"]))
+            done.append(_admin_line(r, TERMINAL_SKIP))
+        conn.commit()
+        return {"dry_run": dry_run, "count": len(done), "jobs": done}
+    finally:
+        conn.close()
+
+
+def events(job_id: str, limit: int = 50) -> list[dict[str, object]]:
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM wiki_job_events WHERE job_id LIKE ? ORDER BY id DESC LIMIT ?",
+            (job_id + "%", max(1, min(int(limit), 500)))).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
 # ------------------------------------------------------------------ status
 def status() -> dict[str, object]:
     conn = connect()
@@ -1111,6 +1524,15 @@ def status() -> dict[str, object]:
         errs = conn.execute(
             "SELECT job_id, last_error, updated_at FROM wiki_jobs"
             " WHERE last_error IS NOT NULL ORDER BY updated_at DESC LIMIT 5").fetchall()
+        alt_done = conn.execute(
+            "SELECT COUNT(*) n FROM wiki_jobs WHERE route='alternate'"
+            " AND status IN ('submitted','merged')").fetchone()
+        alt_ok = conn.execute(
+            "SELECT MAX(at) at FROM wiki_job_events WHERE event='alternate-submitted'").fetchone()
+        alt_err = conn.execute(
+            "SELECT job_id, event, at, detail FROM wiki_job_events WHERE event IN"
+            " ('alternate-invalid','alternate-provider','alternate-quarantined')"
+            " ORDER BY id DESC LIMIT 1").fetchone()
         spooled = 0
         try:
             if SPOOL_DIR.is_dir():
@@ -1130,6 +1552,15 @@ def status() -> dict[str, object]:
             "failed": 0,
             "deferred": int(counts.get("deferred", 0) or 0),
             "quarantined": int(counts.get("quarantined", 0) or 0),
+            "alternate_pending": int(counts.get(ALT_PENDING, 0) or 0),
+            "alternate_leased": int(counts.get(ALT_LEASED, 0) or 0),
+            "alternate_completed": int((alt_done["n"] if alt_done else 0) or 0),
+            "alternate_quarantined": int(counts.get(ALT_QUARANTINED, 0) or 0),
+            "terminal_skip": int(counts.get(TERMINAL_SKIP, 0) or 0),
+            "last_alternate_success_at": (alt_ok["at"] if alt_ok else None),
+            "last_alternate_error": (
+                f"{alt_err['job_id'][:8]} {alt_err['event']} {alt_err['at']}:"
+                f" {(alt_err['detail'] or '')[:120]}" if alt_err else None),
             "last_merge_at": (last_merge["merged_at"] if last_merge else None),
             "errors_compact": [
                 f"{r['job_id'][:8]}: {(r['last_error'] or '')[:120]}" for r in errs
