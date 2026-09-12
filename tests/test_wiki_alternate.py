@@ -127,7 +127,9 @@ def _evenements(wj, job_id):
 
 
 def _noms(wj, job_id):
-    return [e["event"] for e in _evenements(wj, job_id)]
+    # `claim` est trace depuis 2026-09-12 (qui a loue quoi) ; ces tests portent
+    # sur les transitions de route, pas sur les locations.
+    return [e["event"] for e in _evenements(wj, job_id) if e["event"] != "claim"]
 
 
 def _claim_un(wj, source="raw/a.md", sha="a" * 64, contenu=COURT):
@@ -308,7 +310,7 @@ def test_release_alternate_bascule_sans_consommer_de_tentative(wj):
     assert row["route"] == "alternate"
     assert row["alt_reason"] == "SKIPPED_SAFETY plateforme"
     assert wj.ALTERNATE_REQUEST.exists()  # marqueur de reveil depose
-    ev = _evenements(wj, job["job_id"])
+    ev = [e for e in _evenements(wj, job["job_id"]) if e["event"] != "claim"]
     assert [e["event"] for e in ev] == ["route-alternate"]
     assert ev[0]["from_status"] == "leased" and ev[0]["to_status"] == wj.ALT_PENDING
     assert ev[0]["detail"] == "SKIPPED_SAFETY plateforme"
@@ -667,7 +669,9 @@ def test_sync_nouveau_hash_marque_stale_un_job_alternate_pending(wj):
     r = wj.sync_source("raw/a.md", "b" * 64, COURT + "\n\nversion 2")
     assert r["stale"] == 1
     row = _row(wj, job["job_id"])
-    assert row["status"] == "deferred" and row["last_error"].startswith("stale")
+    # Version morte : retiree (`superseded`), sans tentative consommee.
+    assert row["status"] == "superseded" and row["last_error"].startswith("stale")
+    assert row["attempts"] == 0
     assert wj.claim_alternate() is None
 
 
@@ -895,7 +899,8 @@ def test_events_ordre_recent_d_abord_et_limite(wj):
     alt = _alt(wj)
     wj.record_alternate_failure(alt["job_id"], alt["lease_id"], alt["fencing_token"], ["x"])
     ev = wj.events(alt["job_id"])
-    assert [e["event"] for e in ev] == ["alternate-invalid", "route-alternate"]
+    assert [e["event"] for e in ev if e["event"] != "claim"] == [
+        "alternate-invalid", "route-alternate"]
     assert len(wj.events(alt["job_id"][:8], limit=1)) == 1
     for e in ev:
         assert COURT not in (e["detail"] or "")  # jamais de contenu documentaire

@@ -164,6 +164,44 @@ def _is_conversation(path: Path) -> bool:
         return False
 
 
+SUPERSEDED = "superseded"
+
+
+def _supersede(conn: sqlite3.Connection, source_path: str, keep_hash: str) -> int:
+    """Retire de la file les versions antérieures d'une conversation.
+
+    Une conversation vivante change de hash à chaque capture : sans ce retrait,
+    chaque ancienne version restait `pending` pour toujours, en TÊTE de file (ordre
+    `event_id ASC`). Mesuré le 2026-09-12 : 396 lignes pending sur 908 portaient un
+    hash que plus aucun fichier n'a, dont 41 des 50 premières servies par
+    `list_pending(50)`. Un run dépensait alors son budget sur des versions mortes.
+    La ligne est conservée (statut `superseded`), jamais supprimée.
+    """
+    cur = conn.execute(
+        "UPDATE pending_analysis SET status = ? WHERE source_path = ? AND source_hash != ?"
+        " AND version = ? AND status = 'pending'",
+        (SUPERSEDED, source_path, keep_hash, ANALYSIS_VERSION),
+    )
+    return cur.rowcount or 0
+
+
+def supersede_older_versions() -> int:
+    """Rattrapage des files existantes : garde la seule version la plus récente."""
+    conn = connect()
+    try:
+        cur = conn.execute(
+            "UPDATE pending_analysis SET status = ? WHERE status = 'pending' AND version = ?"
+            " AND EXISTS (SELECT 1 FROM pending_analysis n WHERE"
+            " n.source_path = pending_analysis.source_path AND n.version = pending_analysis.version"
+            " AND n.event_id > pending_analysis.event_id AND n.status != 'superseded')",
+            (SUPERSEDED, ANALYSIS_VERSION),
+        )
+        conn.commit()
+        return cur.rowcount or 0
+    finally:
+        conn.close()
+
+
 def scan(limit: int = 0) -> dict[str, int]:
     """Réconcilie la file avec l'état du miroir. Idempotent.
 
@@ -172,18 +210,22 @@ def scan(limit: int = 0) -> dict[str, int]:
     plusieurs secondes pour aucune information nouvelle.
     """
     stats = {"vus": 0, "nouveaux": 0, "modifies": 0, "inchanges": 0,
-             "reprises": 0, "mal_places": 0}
+             "reprises": 0, "mal_places": 0, "remplacees": 0}
     if not RAW_ROOT.is_dir():
         return stats
     stats["reprises"] = reconcile_lost_analyses()
+    stats["remplacees"] = supersede_older_versions()
 
     conn = connect()
     try:
+        # ASC : la dernière ligne vue pour un chemin (la plus récente) gagne. En DESC,
+        # c'était la plus ANCIENNE qui restait dans le dict, et un fichier modifié deux
+        # fois était redéclaré « modifié » à chaque passage.
         known: dict[str, tuple[str, str]] = {
             row["source_path"]: (row["source_hash"], row["status"])
             for row in conn.execute(
                 "SELECT source_path, source_hash, status FROM pending_analysis"
-                " WHERE version = ? ORDER BY event_id DESC",
+                " WHERE version = ? ORDER BY event_id ASC",
                 (ANALYSIS_VERSION,),
             )
         }
@@ -223,6 +265,14 @@ def scan(limit: int = 0) -> dict[str, int]:
                     size, ANALYSIS_VERSION,
                 ),
             )
+            # Retour a une version deja connue (A -> B -> A) : la ligne existe, retiree
+            # quand B est arrivee. La remettre en file, sinon plus rien n'est servi.
+            conn.execute(
+                "UPDATE pending_analysis SET status = 'pending' WHERE source_path = ?"
+                " AND source_hash = ? AND version = ? AND status = ?",
+                (rel, digest, ANALYSIS_VERSION, SUPERSEDED),
+            )
+            stats["remplacees"] += _supersede(conn, rel, digest)
             stats["modifies" if previous else "nouveaux"] += 1
             if limit and (stats["nouveaux"] + stats["modifies"]) >= limit:
                 break
@@ -286,7 +336,12 @@ def reconcile_lost_analyses() -> int:
 def list_pending(limit: int = 10, sources: list[str] | None = None) -> list[PendingItem]:
     conn = connect()
     try:
-        sql = ("SELECT * FROM pending_analysis WHERE status = 'pending' AND version = ?")
+        # Défense en profondeur : même si un scan n'a pas encore retiré une ancienne
+        # version, seule la plus récente ligne d'un chemin est servie.
+        sql = ("SELECT * FROM pending_analysis p WHERE status = 'pending' AND version = ?"
+               " AND NOT EXISTS (SELECT 1 FROM pending_analysis n"
+               " WHERE n.source_path = p.source_path AND n.version = p.version"
+               " AND n.event_id > p.event_id AND n.status != 'superseded')")
         params: list[object] = [ANALYSIS_VERSION]
         if sources:
             sql += " AND source_agent IN (%s)" % ",".join("?" * len(sources))
@@ -307,6 +362,22 @@ def list_pending(limit: int = 10, sources: list[str] | None = None) -> list[Pend
         conn.close()
 
 
+def pending_count() -> int:
+    """Nombre de conversations réellement à analyser (dernière version seulement).
+
+    Pas `status()` : lui parcourt deux fois tout le miroir, pour un seul entier.
+    """
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT source_path) n FROM pending_analysis"
+            " WHERE status = 'pending' AND version = ?", (ANALYSIS_VERSION,),
+        ).fetchone()
+        return int(row["n"] or 0)
+    finally:
+        conn.close()
+
+
 def find_entry(source_path: str, source_hash: str) -> sqlite3.Row | None:
     conn = connect()
     try:
@@ -319,16 +390,36 @@ def find_entry(source_path: str, source_hash: str) -> sqlite3.Row | None:
         conn.close()
 
 
-def mark_done(source_path: str, source_hash: str, analysis_path: str) -> bool:
+def mark_done(source_path: str, source_hash: str, analysis_path: str,
+              source_agent: str = "") -> bool:
+    """Marque l'identité analysée, et retire ses versions antérieures de la file.
+
+    Si le hash lu n'a pas encore de ligne (fichier modifié après le dernier scan,
+    analyse faite sur la version ACTUELLE), la ligne est créée `done` : sinon
+    l'analyse était déposée mais la ligne listée restait `pending` et le compteur
+    ne bougeait pas.
+    """
     conn = connect()
     try:
+        now = _now()
         cur = conn.execute(
             "UPDATE pending_analysis SET status = 'done', analysed_at = ?, analysis_path = ?"
             " WHERE source_path = ? AND source_hash = ? AND version = ? AND status != 'done'",
-            (_now(), analysis_path, source_path, source_hash, ANALYSIS_VERSION),
+            (now, analysis_path, source_path, source_hash, ANALYSIS_VERSION),
         )
+        changed = cur.rowcount > 0
+        if not changed:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO pending_analysis"
+                " (created_at, source_path, source_hash, source_agent, version, status,"
+                "  analysed_at, analysis_path) VALUES (?,?,?,?,?,'done',?,?)",
+                (now, source_path, source_hash, source_agent or "", ANALYSIS_VERSION,
+                 now, analysis_path),
+            )
+            changed = cur.rowcount > 0
+        _supersede(conn, source_path, source_hash)
         conn.commit()
-        return cur.rowcount > 0
+        return changed
     finally:
         conn.close()
 
@@ -365,6 +456,7 @@ def status() -> dict[str, object]:
             "analysis_version": ANALYSIS_VERSION,
             "analysis_pending": counts.get("pending", 0),
             "analysis_done": counts.get("done", 0),
+            "analysis_superseded": counts.get(SUPERSEDED, 0),
             "pending_by_source": by_source,
             "oldest_analysis_pending": dict(oldest) if oldest else None,
             "last_analysis": dict(last) if last else None,

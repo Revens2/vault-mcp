@@ -30,3 +30,11 @@ def _isoler_des_chemins_de_production(
             chemin = racine / nom
             chemin.mkdir()
             monkeypatch.setenv(variable, str(chemin))
+    # Bases d etat : jamais celles de production. `convia_mcp.status()` lisait par
+    # defaut /var/lib/vault-mcp/wiki_jobs.db (lecture seule sur le VPS, absente en
+    # CI) : un test pouvait donc dependre de l etat reel de la file Wiki.
+    for variable, nom in (("VAULT_MCP_TELEMETRY_DB", "telemetry.db"),
+                          ("WIKI_JOBS_DB", "wiki_jobs.db"),
+                          ("CONVIA_QUEUE_DB", "convia.db")):
+        if variable not in os.environ:
+            monkeypatch.setenv(variable, str(racine / nom))
