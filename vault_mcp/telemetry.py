@@ -23,6 +23,7 @@ CLI : `python -m vault_mcp.telemetry runs [--last 10]` et
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import hashlib
 import json
@@ -45,6 +46,8 @@ RETENTION_S = 30 * 86400
 # Deux requetes d'une meme session separees de plus que ca = deux runs distincts.
 RUN_GAP_S = 15 * 60
 MAX_BODY_PARSE = 2_000_000
+# Plafond du tampon de corps (requete pas encore authentifiee a ce stade).
+BODY_BUFFER_MAX = 256_000
 SNIFF_BYTES = 8192
 SMALL_RESPONSE = 6000
 _WRITE_TOOLS = ("convia_write_analysis", "wiki_ingest_submit")
@@ -80,7 +83,12 @@ def db_path() -> Path:
 def connect() -> sqlite3.Connection:
     path = db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    nouveau = not path.exists()
     conn = sqlite3.connect(path, timeout=5)
+    if nouveau:
+        # Pas de contenu ici, mais des horaires d'usage : lisible par le service seul.
+        with contextlib.suppress(OSError):
+            path.chmod(0o600)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
@@ -120,6 +128,18 @@ def parse_request(body: bytes) -> tuple[str, str, str]:
         args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
         ref = _ref(args)
     return method, tool, ref
+
+
+_HEAD_METHOD = re.compile(rb'"method"\s*:\s*"([^"]{1,60})"')
+_HEAD_NAME = re.compile(rb'"name"\s*:\s*"([A-Za-z0-9_]{1,60})"')
+
+
+def _parse_head(head: bytes) -> tuple[str, str, str]:
+    """Corps trop gros pour etre tamponne : methode et outil depuis le debut seulement."""
+    method = _HEAD_METHOD.search(head)
+    name = _HEAD_NAME.search(head)
+    m = method.group(1).decode("ascii", "replace") if method else "?"
+    return m, (name.group(1).decode("ascii") if name and m == "tools/call" else ""), ""
 
 
 _REFUS = re.compile(rb'(\\?"etat\\?"\s*:\s*\\?"refuse\\?"|\\?"isError\\?"\s*:\s*true)')
@@ -185,22 +205,32 @@ class Telemetrie:
         t0 = time.time()
         m0 = time.monotonic()
         http_method = str(scope.get("method", ""))
-        # Lecture complete du corps AVANT de passer la main, puis rejeu a l'app :
-        # necessaire pour connaitre l'outil. Les corps MCP sont bornes (60 Ko max
-        # pour une analyse), aucun flux long en requete.
+        # Ce middleware est AVANT l'authentification : il ne doit jamais retenir en
+        # memoire plus que BODY_BUFFER_MAX octets d'une requete non authentifiee.
+        # On tamponne au plus ce plafond pour identifier l'outil, on le rejoue a
+        # l'app, puis le reste du corps passe en flux sans copie.
         chunks: list[bytes] = []
+        buffered = 0
         disconnected_early = False
+        body_complete = http_method != "POST"
         if http_method == "POST":
-            while True:
+            while buffered < BODY_BUFFER_MAX:
                 msg = await receive()
                 if msg["type"] == "http.disconnect":
                     disconnected_early = True
                     break
-                chunks.append(msg.get("body", b""))
+                data = msg.get("body", b"") or b""
+                chunks.append(data)
+                buffered += len(data)
                 if not msg.get("more_body"):
+                    body_complete = True
                     break
         body = b"".join(chunks)
-        rpc_method, tool, ref = parse_request(body)
+        bytes_in = {"n": len(body)}
+        if body_complete:
+            rpc_method, tool, ref = parse_request(body)
+        else:
+            rpc_method, tool, ref = _parse_head(body)
         state: dict[str, Any] = {
             "status": 0, "bytes_out": 0, "head": b"", "done": False,
             "disconnect": disconnected_early, "session": _header(scope, b"mcp-session-id"),
@@ -213,8 +243,11 @@ class Telemetrie:
                 replayed = True
                 if disconnected_early:
                     return {"type": "http.disconnect"}
-                return {"type": "http.request", "body": body, "more_body": False}
+                return {"type": "http.request", "body": body,
+                        "more_body": not body_complete}
             msg = await receive()
+            if msg["type"] == "http.request":
+                bytes_in["n"] += len(msg.get("body", b"") or b"")
             if msg["type"] == "http.disconnect" and not state["done"]:
                 state["disconnect"] = True
             return msg  # type: ignore[no-any-return]
@@ -243,11 +276,14 @@ class Telemetrie:
         try:
             await self._app(scope, receive_wrapper, send_wrapper)
         except BaseException as exc:
-            outcome = "exception"
-            error = type(exc).__name__
+            if state["disconnect"] and not state["done"]:
+                outcome = "client_disconnect"
+            else:
+                outcome = "exception"
+                error = type(exc).__name__
             raise
         finally:
-            if outcome != "exception":
+            if outcome not in ("exception", "client_disconnect"):
                 if state["disconnect"] and not state["done"]:
                     outcome = "client_disconnect"
                 elif state["status"] >= 400:
@@ -264,7 +300,7 @@ class Telemetrie:
                         outcome = "duplicate"
             if http_method == "DELETE":
                 rpc_method = rpc_method or "session/close"
-            record({
+            row = {
                 "started_at": t0,
                 "duration_ms": int((time.monotonic() - m0) * 1000),
                 "session": (state["session"] or "")[:64] or None,
@@ -274,11 +310,17 @@ class Telemetrie:
                 "tool": tool or None,
                 "ref": ref or None,
                 "http_status": state["status"],
-                "bytes_in": len(body),
+                "bytes_in": bytes_in["n"],
                 "bytes_out": state["bytes_out"],
                 "outcome": outcome,
                 "error": error,
-            })
+            }
+            # Ecriture SQLite hors de la boucle asyncio : un verrou de base ne doit
+            # jamais retarder les autres requetes MCP.
+            try:
+                await asyncio.to_thread(record, row)
+            except BaseException:  # noqa: BLE001 -- annulation : tracer quand meme
+                record(row)
 
 
 # ---------------------------------------------------------------- lecture / CLI

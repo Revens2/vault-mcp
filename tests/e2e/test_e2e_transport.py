@@ -137,3 +137,33 @@ def test_redemarrage_serveur_en_cours_de_run(bench: Bench) -> None:
     listed = c2.call("convia_list_pending_analysis", limit=50)
     assert listed["pending_total"] == 3, "l'ecriture faite avant le crash est conservee"
     c2.close()
+
+
+def test_gros_corps_passe_en_flux_et_reste_trace(bench: Bench, client: RawClient) -> None:
+    """Revue 2026-09-12 : le middleware (avant auth) ne tamponne pas un corps entier."""
+    conv = canary.conversation(0, 2000, seed=5)
+    path = bench.add_conversation(canary.SOURCE, conv.name, conv.body)
+    client.call("convia_scan")
+    read = client.call("convia_read_for_analysis", path=path)
+    enorme = "x" * 400_000  # > BODY_BUFFER_MAX et > MAX_ANALYSIS_CHARS
+    with pytest.raises(ToolRefusedError, match="trop longue"):
+        client.call("convia_write_analysis", source_path=path,
+                    source_hash=read["source_sha256"],
+                    analysis_version=read["analysis_version"], markdown=enorme)
+    time.sleep(0.3)
+    last = [c for c in _calls(bench) if c["tool"]][-1]
+    assert last["tool"] == "convia_write_analysis"
+    assert last["bytes_in"] > 400_000
+    assert last["outcome"] == "tool_error"
+
+
+def test_gros_corps_sans_jeton_refuse_sans_tamponner(bench: Bench) -> None:
+    corps = b'{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{"a":"'
+    corps += b"y" * 3_000_000 + b'"}}}'
+    resp = httpx.post(bench.url, content=corps, timeout=30,
+                      headers={"content-type": "application/json",
+                               "accept": "application/json, text/event-stream"})
+    assert resp.status_code == 401
+    last = _calls(bench)[-1]
+    assert last["outcome"] in ("http_error", "client_disconnect")
+    assert bench.proc is not None and bench.proc.poll() is None, "serveur toujours vivant"
