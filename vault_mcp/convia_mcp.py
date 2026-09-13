@@ -271,6 +271,46 @@ def confirm_analysis(source_path: str, source_hash: str, analysis_path: str,
     return convia_queue.mark_done(source_path, source_hash, analysis_path, source_agent)
 
 
+# --------------------------------------------- convia_mark_blocked / requeue
+def mark_blocked(path: str, reason: str, actor: str = "chatgpt") -> dict[str, object]:
+    """Sort durablement une conversation que le consommateur ne peut pas analyser.
+
+    `path` est celui rendu par `convia_list_pending_analysis` (aucun hash à
+    connaître : c'est la version en attente la plus récente qui est bloquée).
+    `reason` est exigé : un blocage sans motif est un refus, pas une rustine.
+    La source reste intacte, la ligne est conservée (`blocked`), l'action est
+    auditée, et une requeue admin reste possible.
+    """
+    relative = _check_namespace(path)
+    motif = (reason or "").strip()
+    if not motif:
+        raise ConviaError("motif exigé : pourquoi cette conversation est-elle illisible ?")
+    if len(motif) > 500:
+        raise ConviaError("motif trop long : 500 caractères maximum")
+    res = convia_queue.mark_blocked(relative, motif, actor=actor)
+    if res is None:
+        raise ConviaError(f"aucune analyse en attente pour : {relative}")
+    return {"blocked": True, "path": res["source_path"],
+            "source_hash": res["source_hash"], "reason": res["reason"],
+            "blocked_at": res["blocked_at"]}
+
+
+def requeue_blocked(path: str, actor: str = "admin") -> dict[str, object]:
+    """Remet en file une conversation bloquée (nouvel essai / cause réparée)."""
+    relative = _check_namespace(path)
+    res = convia_queue.requeue_blocked(relative, actor=actor)
+    if res is None:
+        raise ConviaError(f"aucune unité bloquée pour : {relative}")
+    return {"requeued": True, "path": res["source_path"],
+            "source_hash": res["source_hash"], "requeued_at": res["requeued_at"]}
+
+
+def list_blocked(limit: int = 50) -> dict[str, object]:
+    """Unités bloquées, pour observabilité et futur rattrapage. Lecture seule."""
+    items = convia_queue.list_blocked(limit=limit)
+    return {"blocked_total": len(items), "items": items}
+
+
 # ---------------------------------------------------------------- wiki_ingest_*
 def _read_state(name: str) -> str | None:
     try:
