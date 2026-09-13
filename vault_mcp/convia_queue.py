@@ -48,9 +48,22 @@ CREATE TABLE IF NOT EXISTS pending_analysis (
     status       TEXT    NOT NULL DEFAULT 'pending',
     analysed_at  TEXT,
     analysis_path TEXT,
+    blocked_reason TEXT NOT NULL DEFAULT '',
+    blocked_at   TEXT,
     UNIQUE (source_path, source_hash, version)
 );
 CREATE INDEX IF NOT EXISTS idx_pending_status ON pending_analysis (status, event_id);
+
+CREATE TABLE IF NOT EXISTS blocked_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    at          TEXT    NOT NULL,
+    source_path TEXT    NOT NULL,
+    source_hash TEXT    NOT NULL,
+    action      TEXT    NOT NULL,
+    reason      TEXT    NOT NULL DEFAULT '',
+    actor       TEXT    NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_blocked_events_path ON blocked_events (source_path, id);
 
 CREATE TABLE IF NOT EXISTS scan_state (
     cle    TEXT PRIMARY KEY,
@@ -70,7 +83,23 @@ def connect() -> sqlite3.Connection:
     # WAL : le scanner écrit pendant que les outils MCP lisent, sans se bloquer.
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    _migrate_blocked_columns(conn)
     return conn
+
+
+def _migrate_blocked_columns(conn: sqlite3.Connection) -> None:
+    """Bases créées avant le statut `blocked` : ajoute les colonnes manquantes.
+
+    SQLite n'a pas de `ADD COLUMN IF NOT EXISTS` sur les vieilles versions :
+    on inspecte le schéma, on n'ajoute que l'absent. Idempotent.
+    """
+    have = {row["name"] for row in conn.execute("PRAGMA table_info(pending_analysis)")}
+    if "blocked_reason" not in have:
+        conn.execute("ALTER TABLE pending_analysis ADD COLUMN blocked_reason TEXT"
+                     " NOT NULL DEFAULT ''")
+    if "blocked_at" not in have:
+        conn.execute("ALTER TABLE pending_analysis ADD COLUMN blocked_at TEXT")
+    conn.commit()
 
 
 def _now() -> str:
@@ -165,6 +194,15 @@ def _is_conversation(path: Path) -> bool:
 
 
 SUPERSEDED = "superseded"
+BLOCKED = "blocked"
+
+# Motifs de blocage : le consommateur ChatGPT ne peut définitivement pas
+# lire/analyser la conversation (refus plateforme répété, lecture impossible).
+# `blocked` est DURABLE : ni le scan ni une relecture ne le retire — seule une
+# requeue admin (`requeue_blocked`) ou une NOUVELLE version de la source
+# (nouveau hash → nouvelle ligne `pending`) remet l'unité en file. La ligne
+# n'est jamais supprimée, la source jamais touchée.
+BLOCKED_ACTIONS = ("blocked", "requeued")
 
 
 def _supersede(conn: sqlite3.Connection, source_path: str, keep_hash: str) -> int:
@@ -267,6 +305,8 @@ def scan(limit: int = 0) -> dict[str, int]:
             )
             # Retour a une version deja connue (A -> B -> A) : la ligne existe, retiree
             # quand B est arrivee. La remettre en file, sinon plus rien n'est servi.
+            # Seulement `superseded` : une version `blocked` ne ressuscite jamais
+            # seule — il faut une requeue admin explicite, ou une nouvelle version.
             conn.execute(
                 "UPDATE pending_analysis SET status = 'pending' WHERE source_path = ?"
                 " AND source_hash = ? AND version = ? AND status = ?",
@@ -337,7 +377,9 @@ def list_pending(limit: int = 10, sources: list[str] | None = None) -> list[Pend
     conn = connect()
     try:
         # Défense en profondeur : même si un scan n'a pas encore retiré une ancienne
-        # version, seule la plus récente ligne d'un chemin est servie.
+        # version, seule la plus récente ligne d'un chemin est servie. Une version
+        # `blocked` (statut != 'superseded') masque aussi les anciennes `pending` :
+        # le chemin bloqué ne revient jamais en tête de file par ses vieux hash.
         sql = ("SELECT * FROM pending_analysis p WHERE status = 'pending' AND version = ?"
                " AND NOT EXISTS (SELECT 1 FROM pending_analysis n"
                " WHERE n.source_path = p.source_path AND n.version = p.version"
@@ -424,6 +466,119 @@ def mark_done(source_path: str, source_hash: str, analysis_path: str,
         conn.close()
 
 
+def mark_blocked(source_path: str, reason: str, actor: str = "") -> dict[str, object] | None:
+    """Sort durablement une unité de la file : elle ne sera plus jamais servie.
+
+    Ne touche ni au fichier source ni aux compteurs `done` : seule la ligne
+    `pending` la plus récente du chemin passe à `blocked`, avec le motif et
+    l'horodatage conservés, plus une entrée d'audit dans `blocked_events`.
+    Les versions antérieures encore `pending` (file héritée) sont retirées
+    comme `superseded` : le chemin ne doit plus rien exposer en tête de file.
+    Rend la ligne bloquée, ou None si rien n'était en attente pour ce chemin.
+    """
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT event_id, source_hash FROM pending_analysis"
+            " WHERE source_path = ? AND version = ? AND status = 'pending'"
+            " ORDER BY event_id DESC LIMIT 1",
+            (source_path, ANALYSIS_VERSION),
+        ).fetchone()
+        if row is None:
+            return None
+        now = _now()
+        motif = (reason or "").strip()[:500]
+        _supersede(conn, source_path, str(row["source_hash"]))
+        conn.execute(
+            "UPDATE pending_analysis SET status = ?, blocked_reason = ?, blocked_at = ?"
+            " WHERE event_id = ?",
+            (BLOCKED, motif, now, row["event_id"]),
+        )
+        conn.execute(
+            "INSERT INTO blocked_events (at, source_path, source_hash, action, reason, actor)"
+            " VALUES (?,?,?,?,?,?)",
+            (now, source_path, row["source_hash"], "blocked", motif, actor[:120]),
+        )
+        conn.commit()
+        return {"event_id": row["event_id"], "source_path": source_path,
+                "source_hash": row["source_hash"], "reason": motif, "blocked_at": now}
+    finally:
+        conn.close()
+
+
+def requeue_blocked(source_path: str, actor: str = "") -> dict[str, object] | None:
+    """Remet en file la dernière unité bloquée d'un chemin (admin / nouvel essai).
+
+    La cause du blocage reste lisible (`blocked_reason`) : c'est l'historique,
+    pas un état. Rend la ligne remise en file, ou None si rien n'était bloqué.
+    """
+    conn = connect()
+    try:
+        row = conn.execute(
+            "SELECT event_id, source_hash, blocked_reason FROM pending_analysis"
+            " WHERE source_path = ? AND version = ? AND status = ?"
+            " ORDER BY event_id DESC LIMIT 1",
+            (source_path, ANALYSIS_VERSION, BLOCKED),
+        ).fetchone()
+        if row is None:
+            return None
+        now = _now()
+        conn.execute(
+            "UPDATE pending_analysis SET status = 'pending' WHERE event_id = ?",
+            (row["event_id"],),
+        )
+        conn.execute(
+            "INSERT INTO blocked_events (at, source_path, source_hash, action, reason, actor)"
+            " VALUES (?,?,?,?,?,?)",
+            (now, source_path, row["source_hash"], "requeued",
+             str(row["blocked_reason"] or ""), actor[:120]),
+        )
+        conn.commit()
+        return {"event_id": row["event_id"], "source_path": source_path,
+                "source_hash": row["source_hash"], "requeued_at": now}
+    finally:
+        conn.close()
+
+
+def list_blocked(limit: int = 50) -> list[dict[str, object]]:
+    """Unités bloquées, les plus récentes d'abord. Lecture seule.
+
+    Point d'entrée du jour où un worker de rattrapage local existera : il
+    réclamera ici, jamais dans `list_pending` (réservé au consommateur ChatGPT).
+    """
+    conn = connect()
+    try:
+        return [
+            {"event_id": row["event_id"], "path": row["source_path"],
+             "source": row["source_agent"], "session_id": row["session_id"],
+             "title": row["title"], "hash": row["source_hash"],
+             "reason": row["blocked_reason"], "blocked_at": row["blocked_at"]}
+            for row in conn.execute(
+                "SELECT event_id, source_path, source_agent, session_id, title,"
+                " source_hash, blocked_reason, blocked_at FROM pending_analysis"
+                " WHERE status = ? AND version = ? ORDER BY event_id DESC LIMIT ?",
+                (BLOCKED, ANALYSIS_VERSION, max(1, min(limit or 50, 200))),
+            )
+        ]
+    finally:
+        conn.close()
+
+
+def blocked_events(source_path: str, limit: int = 50) -> list[dict[str, object]]:
+    """Journal d'audit des blocages / remises en file d'un chemin."""
+    conn = connect()
+    try:
+        return [
+            dict(r) for r in conn.execute(
+                "SELECT at, source_path, source_hash, action, reason, actor"
+                " FROM blocked_events WHERE source_path = ? ORDER BY id DESC LIMIT ?",
+                (source_path, max(1, min(limit or 50, 200))),
+            )
+        ]
+    finally:
+        conn.close()
+
+
 def status() -> dict[str, object]:
     conn = connect()
     try:
@@ -457,6 +612,7 @@ def status() -> dict[str, object]:
             "analysis_pending": counts.get("pending", 0),
             "analysis_done": counts.get("done", 0),
             "analysis_superseded": counts.get(SUPERSEDED, 0),
+            "analysis_blocked": counts.get(BLOCKED, 0),
             "pending_by_source": by_source,
             "oldest_analysis_pending": dict(oldest) if oldest else None,
             "last_analysis": dict(last) if last else None,
@@ -506,5 +662,11 @@ if __name__ == "__main__":
 
     if len(sys.argv) > 1 and sys.argv[1] == "status":
         print(json.dumps(status(), indent=1, ensure_ascii=False))
+    elif len(sys.argv) > 1 and sys.argv[1] == "blocked":
+        print(json.dumps(list_blocked(), indent=1, ensure_ascii=False))
+    elif len(sys.argv) > 2 and sys.argv[1] == "requeue":
+        res = requeue_blocked(sys.argv[2], actor="cli")
+        print(json.dumps(res or {"requeued": False, "path": sys.argv[2]},
+                         indent=1, ensure_ascii=False))
     else:
         print(json.dumps(scan(), indent=1))

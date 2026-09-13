@@ -1192,6 +1192,53 @@ def convia_write_analysis(
 
 
 @mcp.tool()
+def convia_mark_blocked(path: str, reason: str) -> dict[str, object]:
+    """Durably park a conversation you definitively cannot read or analyse.
+
+    Use the `path` returned by convia_list_pending_analysis — no hash needed,
+    the newest pending version is parked. `reason` is required (e.g.
+    "platform refusal on read", "projection unreadable after 3 attempts").
+    The parked unit leaves the pending queue forever: it never comes back at
+    the head of the backlog, the source file is untouched, nothing is deleted,
+    the `done` counters are unchanged, and an admin can requeue it later.
+    A MODIFIED source (new hash) becomes pending again on its own. Requires
+    `mcp:ecriture`.
+    """
+    refus = _exiger_ecriture()
+    if refus:
+        return _erreur(refus)
+    try:
+        return convia_mcp.mark_blocked(path, reason)
+    except (convia_mcp.ConviaError, OSError) as exc:
+        return _erreur(f"ERREUR: {exc}")
+
+
+@mcp.tool()
+def convia_requeue_blocked(path: str) -> dict[str, object]:
+    """Put a parked (`blocked`) conversation back in the pending queue.
+
+    For a new attempt after the blocking cause was fixed. Requires
+    `mcp:ecriture`.
+    """
+    refus = _exiger_ecriture()
+    if refus:
+        return _erreur(refus)
+    try:
+        return convia_mcp.requeue_blocked(path)
+    except (convia_mcp.ConviaError, OSError) as exc:
+        return _erreur(f"ERREUR: {exc}")
+
+
+@mcp.tool()
+def convia_list_blocked(limit: int = 10) -> dict[str, object]:
+    """Parked (`blocked`) conversations with their reasons. Read-only."""
+    try:
+        return convia_mcp.list_blocked(limit=limit)
+    except (convia_mcp.ConviaError, OSError) as exc:
+        return _erreur(f"ERREUR: {exc}")
+
+
+@mcp.tool()
 def convia_scan() -> dict[str, object]:
     """Reconcile the pending queue with the mirror, now.
 
