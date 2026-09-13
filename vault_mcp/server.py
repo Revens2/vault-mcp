@@ -50,6 +50,7 @@ from vault_mcp import __version__, convia_mcp, convia_queue, dirty
 from vault_mcp.secrets import masquer
 from vault_mcp.spool import Spool, SpoolError
 from vault_mcp.store import StoreError
+from vault_mcp.telemetry import Telemetrie
 
 
 def _config() -> tuple[str, int]:
@@ -1134,9 +1135,9 @@ def convia_write_analysis(
     You do NOT choose the destination path: it is derived from the source, so the
     same conversation can never produce two notes. `source_hash` must be the
     `source_sha256` returned by convia_read_for_analysis — a stale hash is refused
-    rather than producing an analysis of a version that no longer exists. An
-    identity already analysed (source_path, source_hash, analysis_version) is
-    refused too. Requires the `mcp:ecriture` scope.
+    rather than producing an analysis of a version that no longer exists. Replaying
+    an identity already analysed (source_path, source_hash, analysis_version) is
+    safe: it returns `duplicate: true` and writes nothing. Requires `mcp:ecriture`.
     """
     refus = _exiger_ecriture()
     if refus:
@@ -1147,6 +1148,13 @@ def convia_write_analysis(
         )
     except (convia_mcp.ConviaError, OSError) as exc:
         return _erreur(f"ERREUR: {exc}")
+    if prepared.get("duplicate"):
+        return {
+            "etat": "deja_analysee",
+            "duplicate": True,
+            "path": prepared["path"],
+            "message": "identite deja analysee : rejeu sans nouveau depot",
+        }
 
     chemin = str(prepared["path"])
     contenu = str(prepared["content"])
@@ -1170,11 +1178,13 @@ def convia_write_analysis(
     # La file n est marquee qu APRES un depot accepte. L inverse perdrait une
     # conversation a chaque echec de spool.
     convia_mcp.confirm_analysis(
-        str(prepared["source_path"]), str(prepared["source_hash"]), note.relatif
+        str(prepared["source_path"]), str(prepared["source_hash"]), note.relatif,
+        str(prepared.get("source_agent") or ""),
     )
     return {
         "id": recu.get("id"),
         "etat": recu.get("etat", "en_attente"),
+        "duplicate": False,
         "path": note.relatif,
         "remplacee": existe,
         "message": "analyse deposee ; interroger write_status(id) pour la confirmation",
@@ -1382,7 +1392,7 @@ def construire_application() -> Application:
     # l'OAuth sur la variante a slash final, constate le 2026-09-05 (session
     # anonyme acceptee via le tunnel ngrok). Sans secret, la voie est inerte :
     # `chemin_secret_valide` refuse systematiquement un chemin secret vide.
-    return Authentification(
+    application = Authentification(
         mcp.streamable_http_app(
             streamable_http_path=CHEMIN_PUBLIC,
             transport_security=TransportSecuritySettings(
@@ -1393,6 +1403,11 @@ def construire_application() -> Application:
         chemin_secret=CHEMIN_SECRET if SECRET else "",
         chemin_public=CHEMIN_PUBLIC,
     )
+    # Journal des appels (vault_mcp.telemetry) : a l exterieur, pour voir aussi les
+    # 401 et les coupures. `VAULT_MCP_TELEMETRY=0` le retire sans redeploiement.
+    if os.environ.get("VAULT_MCP_TELEMETRY", "1") == "1":
+        return Telemetrie(application, chemin=CHEMIN_PUBLIC)
+    return application
 
 
 # Arret borne, en deux etages.

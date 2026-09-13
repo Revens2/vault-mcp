@@ -56,8 +56,11 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CONVIA_RAW_ROOT", str(raw_root))
     import importlib
 
-    from vault_mcp import convia_mcp, convia_queue
+    from vault_mcp import convia_mcp, convia_queue, wiki_jobs
     importlib.reload(convia_queue)
+    # wiki_jobs fige WIKI_JOBS_DB a l import : le recharger sous l environnement isole,
+    # sinon `status()` lit la file Wiki de production.
+    importlib.reload(wiki_jobs)
     importlib.reload(convia_mcp)
     convia_queue.scan()
     return convia_mcp, convia_queue, conv
@@ -191,8 +194,12 @@ def test_same_identity_is_never_processed_twice(env):
     prepared = mcp.prepare_analysis(path, digest, queue.ANALYSIS_VERSION, "# Analyse")
     assert mcp.confirm_analysis(path, digest, str(prepared["path"])) is True
 
-    with pytest.raises(mcp.ConviaError, match="déjà produite"):
-        mcp.prepare_analysis(path, digest, queue.ANALYSIS_VERSION, "# Analyse bis")
+    # Rejeu (reponse MCP perdue) : meme identite -> meme resultat, aucun contenu a deposer.
+    replay = mcp.prepare_analysis(path, digest, queue.ANALYSIS_VERSION, "# Analyse bis")
+    assert replay["duplicate"] is True
+    assert replay["path"] == prepared["path"]
+    assert "content" not in replay
+    assert mcp.confirm_analysis(path, digest, str(prepared["path"])) is False
     assert queue.status()["analysis_pending"] == 0
 
 
@@ -323,3 +330,57 @@ def test_ingest_start_signale_un_depot_impossible(env, tmp_path, monkeypatch):
     monkeypatch.setattr(mcp, "INGEST_REQUEST", tmp_path / "fichier" / "x" / "req")
     (tmp_path / "fichier").write_text("pas un dossier", encoding="utf-8")
     assert mcp.ingest_start()["state"] == "deprecated"
+
+
+# ---------------------------------------------------------------------------
+# File polluee par les versions mortes (constat production 2026-09-12)
+# ---------------------------------------------------------------------------
+def test_versions_anterieures_retirees_de_la_file(env):
+    mcp, queue, conv = env
+    for k in range(3):
+        conv.write_text(RAW + f"\nsuite {k}\n", encoding="utf-8")
+        queue.scan()
+    items = queue.list_pending(limit=50)
+    assert len(items) == 1
+    assert items[0].source_hash == queue.sha256_of(conv)
+    st = queue.status()
+    assert st["analysis_pending"] == 1 and st["analysis_superseded"] == 3
+    assert queue.pending_count() == 1
+
+
+def test_rattrapage_d_une_file_existante_deja_polluee(env):
+    mcp, queue, conv = env
+    rel = "raw/assets/ConvIA/Claude-CLI/2026-09-01_deploiement-casse_9f8e7d6c.md"
+    conn = queue.connect()
+    for h in ("1" * 64, "2" * 64):  # lignes heritees de l ancien scan, jamais retirees
+        conn.execute("INSERT INTO pending_analysis (created_at, source_path, source_hash,"
+                     " source_agent, version) VALUES ('2026-09-01T00:00:00Z', ?, ?, 'x', ?)",
+                     (rel, h, queue.ANALYSIS_VERSION))
+    conn.commit()
+    conn.close()
+    queue.scan()
+    items = queue.list_pending(limit=50)
+    assert [i.source_hash for i in items] == [queue.sha256_of(conv)]
+
+
+def test_analyse_sur_hash_non_encore_scanne_fait_bouger_la_file(env):
+    mcp, queue, conv = env
+    path = "raw/assets/ConvIA/Claude-CLI/2026-09-01_deploiement-casse_9f8e7d6c.md"
+    conv.write_text(RAW + "\nnouveau\n", encoding="utf-8")  # pas de scan
+    digest = queue.sha256_of(conv)
+    prepared = mcp.prepare_analysis(path, digest, queue.ANALYSIS_VERSION, "# A")
+    assert mcp.confirm_analysis(path, digest, str(prepared["path"]),
+                                str(prepared["source_agent"])) is True
+    assert queue.list_pending(limit=50) == []
+    assert queue.pending_count() == 0
+
+
+def test_retour_a_une_version_deja_connue_reste_servi(env):
+    mcp, queue, conv = env
+    a = conv.read_text(encoding="utf-8")
+    conv.write_text(a + "\nversion B\n", encoding="utf-8")
+    queue.scan()
+    conv.write_text(a, encoding="utf-8")  # A -> B -> A
+    queue.scan()
+    items = queue.list_pending(limit=50)
+    assert [i.source_hash for i in items] == [queue.sha256_of(conv)]

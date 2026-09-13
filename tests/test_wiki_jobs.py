@@ -914,3 +914,47 @@ def test_contrat_reel_json_schema_et_flux_complet(mcp, monkeypatch):
                                   wj.CONTRACT_VERSION, _frais(doc),
                                   c["contract_digest"])["duplicate"] is True
     assert convia_mcp.wiki_merge_pending()["merged"] == 1
+
+
+# ------------------------------------------------- mort du consommateur (2026-09-12)
+def _expirer(wj, job_id):
+    conn = wj.connect()
+    conn.execute("UPDATE wiki_jobs SET expires_at=1 WHERE job_id=?", (job_id,))
+    conn.commit()
+    conn.close()
+
+
+def test_reaper_rend_le_bail_sans_tentative_et_trace(wj):
+    wj.sync_source("raw/a.md", "a" * 64, "Contenu court. " * 10)
+    job = wj.claim(limit=1)["jobs"][0]
+    _expirer(wj, job["job_id"])
+    assert wj.status()["leased_expired"] == 1
+    assert wj.reap_expired("test") == 1
+    row = wj.connect().execute("SELECT * FROM wiki_jobs WHERE job_id=?",
+                               (job["job_id"],)).fetchone()
+    assert row["status"] == "pending" and row["attempts"] == 0
+    assert [e["event"] for e in wj.events(job["job_id"])][:2] == ["lease-expired", "claim"]
+    again = wj.claim(limit=1)["jobs"][0]
+    assert again["fencing_token"] == job["fencing_token"] + 1
+
+
+def test_bail_plafonne_et_renew_plafonne(wj):
+    wj.sync_source("raw/a.md", "a" * 64, "Contenu court. " * 10)
+    job = wj.claim(limit=1, lease_seconds=86400)["jobs"][0]
+    row = wj.connect().execute("SELECT expires_at FROM wiki_jobs WHERE job_id=?",
+                               (job["job_id"],)).fetchone()
+    assert row["expires_at"] - wj._now_ts() <= wj.MAX_LEASE_S
+    wj.release(job["job_id"], job["lease_id"], "renew")
+    row = wj.connect().execute("SELECT expires_at FROM wiki_jobs WHERE job_id=?",
+                               (job["job_id"],)).fetchone()
+    assert row["expires_at"] - wj._now_ts() <= wj.MAX_LEASE_S
+
+
+def test_job_d_une_version_morte_jamais_loue_ni_penalise(wj):
+    wj.sync_source("raw/a.md", "a" * 64, "Version un. " * 10)
+    wj.sync_source("raw/a.md", "b" * 64, "Version deux. " * 10)
+    jobs = wj.claim(limit=10)["jobs"]
+    assert {j["source_hash"] for j in jobs} == {"b" * 64}
+    rows = wj.connect().execute(
+        "SELECT status, attempts FROM wiki_jobs WHERE source_hash=?", ("a" * 64,)).fetchall()
+    assert all(r["status"] == "superseded" and r["attempts"] == 0 for r in rows)

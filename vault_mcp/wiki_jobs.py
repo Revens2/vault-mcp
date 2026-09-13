@@ -154,7 +154,16 @@ ALT_PENDING = "alternate_pending"
 ALT_LEASED = "alternate_leased"
 ALT_QUARANTINED = "alternate_quarantined"
 TERMINAL_SKIP = "terminal_skip"
+SUPERSEDED = "superseded"
 MAX_ALT_ATTEMPTS = 3
+
+# Bail de la route ChatGPT, plafonne. Le consommateur est une tache horaire : un bail
+# d'1 h expirait quelques secondes APRES le claim du run suivant (mesure 2026-09-12 :
+# 10 baux pris a 16:16:08, expires 17:16:08, run suivant a 17:00), donc un
+# consommateur mort bloquait ses jobs ~2 h. Avec un claim juste-a-temps (1 job ->
+# read -> extract -> submit), 15 min couvrent largement un job ; `renew` existe.
+MAX_LEASE_S = int(os.environ.get("WIKI_MAX_LEASE_S", "900"))
+MIN_LEASE_S = int(os.environ.get("WIKI_MIN_LEASE_S", "60"))
 # Marqueur de reveil du worker alternatif, meme principe que INGEST_REQUEST
 # (convia_mcp) : le service expose depose, une unite .path lance le worker.
 ALTERNATE_REQUEST = Path(os.environ.get(
@@ -332,14 +341,22 @@ def sync_source(source: str, source_hash: str, content: str,
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        # Marquer stale les anciens hash non termines de cette source.
+        # Retirer les anciens hash non termines de cette source. `superseded` et non
+        # `deferred` : un job d'une version morte ne peut JAMAIS aboutir (CAS au
+        # submit), le laisser reclamable faisait extraire puis refuser le meme job
+        # jusqu'a 3 fois, et brulait une tentative sans aucune faute du consommateur.
+        stale_rows = conn.execute(
+            "SELECT * FROM wiki_jobs WHERE source=? AND source_hash!=? AND contract_version=?"
+            " AND status IN ('pending','leased','deferred','alternate_pending','alternate_leased')",
+            (source, source_hash, CONTRACT_VERSION)).fetchall()
+        for row in stale_rows:
+            _event(conn, row, "superseded", SUPERSEDED, "sync", "source modifiee")
         cur = conn.execute(
-            "UPDATE wiki_jobs SET status='deferred', attempts=attempts+1,"
-            " lease_id=NULL, expires_at=NULL,"
+            "UPDATE wiki_jobs SET status=?, lease_id=NULL, expires_at=NULL,"
             " last_error='stale: source modifiee, nouvelle version en file',"
             " updated_at=? WHERE source=? AND source_hash!=? AND contract_version=?"
             " AND status IN ('pending','leased','deferred','alternate_pending','alternate_leased')",
-            (now, source, source_hash, CONTRACT_VERSION),
+            (SUPERSEDED, now, source, source_hash, CONTRACT_VERSION),
         )
         stale = cur.rowcount or 0
         synced = 0
@@ -365,6 +382,9 @@ def sync_source(source: str, source_hash: str, content: str,
 def sync_directory(limit_files: int = 0) -> dict[str, int]:
     """Decouverte + snapshot des sources eligibles. Deterministe, sans LLM."""
     stats = {"vus": 0, "eligibles": 0, "jobs_crees": 0, "exclus": 0, "erreurs": 0}
+    # Chaque run appelle sync en tete de phase Wiki : c'est le point ou les baux
+    # abandonnes par un run precedent sont rendus, meme si ce run ne claim jamais.
+    stats["baux_expires_rendus"] = reap_expired("sync")
     if not RAW_DIR.is_dir():
         return stats
     files: list[Path] = []
@@ -403,6 +423,42 @@ def sync_directory(limit_files: int = 0) -> dict[str, int]:
     return stats
 
 
+# ------------------------------------------------------------------ reaper
+def _reap_expired(conn: sqlite3.Connection, now: int, actor: str) -> int:
+    """Rend a la file ChatGPT les baux `leased` expires, avec une trace.
+
+    Transaction de l'appelant (BEGIN IMMEDIATE deja pris). Aucune tentative
+    consommee : la mort du consommateur n'est pas une faute du document. Le
+    fencing n'est PAS remis a zero, le prochain claim l'incremente : l'ancien
+    detenteur reste refuse. Avant, ces baux restaient `leased` jusqu'a ce qu'un
+    claim les reprenne, sans aucune ligne d'evenement : invisible (constat
+    2026-09-12, 10 baux expires depuis 17:16, toujours `leased` a 19:52).
+    """
+    rows = conn.execute(
+        "SELECT * FROM wiki_jobs WHERE status='leased' AND expires_at IS NOT NULL"
+        " AND expires_at < ?", (now,)).fetchall()
+    for row in rows:
+        _event(conn, row, "lease-expired", "pending", actor,
+               f"fencing {int(row['fencing_token'] or 0)} abandonne")
+        conn.execute(
+            "UPDATE wiki_jobs SET status='pending', lease_id=NULL, expires_at=NULL,"
+            " last_error='bail expire : consommateur disparu avant submit/release',"
+            " updated_at=? WHERE job_id=? AND status='leased'",
+            (_now_iso(), row["job_id"]))
+    return len(rows)
+
+
+def reap_expired(actor: str = "reaper") -> int:
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        n = _reap_expired(conn, _now_ts(), actor)
+        conn.commit()
+        return n
+    finally:
+        conn.close()
+
+
 # ------------------------------------------------------------------ claim
 def claim(limit: int = 10, max_bytes: int = 0,
           lease_seconds: int = DEFAULT_LEASE_S) -> dict[str, object]:
@@ -413,24 +469,25 @@ def claim(limit: int = 10, max_bytes: int = 0,
     """
     digest = _contract_digest()
     limit = max(1, min(int(limit or 10), MAX_CLAIM_LIMIT))
-    lease_seconds = max(60, min(int(lease_seconds or DEFAULT_LEASE_S), 86400))
+    lease_seconds = max(MIN_LEASE_S, min(int(lease_seconds or MAX_LEASE_S), MAX_LEASE_S))
     now = _now_ts()
     expires = now + lease_seconds
     conn = connect()
     try:
         conn.execute("BEGIN IMMEDIATE")
-        # Les baux expires sont reattribuables, quel que soit leur statut :
-        # sans ca, un job `leased` dont le detenteur est mort resterait coince
-        # (starvation, aucun reaper en tache de fond par conception).
+        _reap_expired(conn, now, "claim")
+        # Un job dont la source a une version plus recente ne peut plus aboutir :
+        # ne jamais le louer (il serait extrait pour rien puis refuse au submit).
         rows = conn.execute(
-            "SELECT * FROM wiki_jobs WHERE contract_version=?"
+            "SELECT * FROM wiki_jobs j WHERE contract_version=?"
             " AND attempts < ?"
-            " AND ((status IN ('pending','deferred')"
-            "       AND (expires_at IS NULL OR expires_at < ?))"
-            "      OR (status = 'leased' AND expires_at IS NOT NULL"
-            "          AND expires_at < ?))"
+            " AND status IN ('pending','deferred')"
+            " AND (expires_at IS NULL OR expires_at < ?)"
+            " AND NOT EXISTS (SELECT 1 FROM wiki_jobs n WHERE n.source=j.source"
+            "   AND n.source_hash!=j.source_hash AND n.contract_version=j.contract_version"
+            "   AND n.rowid > j.rowid)"
             " ORDER BY created_at ASC LIMIT ?",
-            (CONTRACT_VERSION, MAX_ATTEMPTS, now, now, limit * 4),
+            (CONTRACT_VERSION, MAX_ATTEMPTS, now, limit * 4),
         ).fetchall()
         picked = []
         total_bytes = 0
@@ -444,15 +501,15 @@ def claim(limit: int = 10, max_bytes: int = 0,
             new_fencing = int(row["fencing_token"] or 0) + 1
             cur = conn.execute(
                 "UPDATE wiki_jobs SET status='leased', lease_id=?,"
-                " fencing_token=?, expires_at=?, renews=0, updated_at=?,"
-                " last_error=CASE WHEN status='leased'"
-                " THEN 'reattribue apres expiration' ELSE last_error END"
-                " WHERE job_id=? AND status IN ('pending','deferred','leased')"
+                " fencing_token=?, expires_at=?, renews=0, updated_at=?"
+                " WHERE job_id=? AND status IN ('pending','deferred')"
                 " AND (expires_at IS NULL OR expires_at < ?)",
                 (lease_id, new_fencing, expires,
                  _now_iso(), row["job_id"], now),
             )
             if cur.rowcount == 1:
+                _event(conn, row, "claim", "leased", "claim",
+                       f"fencing {new_fencing} lease {lease_seconds}s")
                 total_bytes += cb
                 picked.append({
                     "job_id": row["job_id"],
@@ -1010,11 +1067,14 @@ def submit(job_id: str, lease_id: str, fencing_token: int,
              int(cur_rowid["rowid"]))).fetchone()
         if int(newer["n"] or 0) > 0 and row["status"] in (
                 "leased", "pending", "deferred", ALT_PENDING, ALT_LEASED):
+            _event(conn, row, "superseded", SUPERSEDED, "submit", "source modifiee")
             conn.execute(
-                "UPDATE wiki_jobs SET status='deferred', attempts=attempts+1,"
-                " lease_id=NULL, expires_at=NULL,"
+                "UPDATE wiki_jobs SET status=?, lease_id=NULL, expires_at=NULL,"
                 " last_error='stale: source modifiee', updated_at=? WHERE job_id=?",
-                (_now_iso(), job_id))
+                (SUPERSEDED, _now_iso(), job_id))
+            conn.commit()
+            raise WikiJobsError("stale : la source a change, relire le nouveau job")
+        if row["status"] == SUPERSEDED:
             conn.commit()
             raise WikiJobsError("stale : la source a change, relire le nouveau job")
         # Idempotence AVANT controle du bail, a dessein : le retry d'un appel
@@ -1200,7 +1260,7 @@ def release(job_id: str, lease_id: str, action: str = "release",
         conn.execute(
             "UPDATE wiki_jobs SET expires_at=?, renews=renews+1,"
             " updated_at=? WHERE job_id=?",
-            (_now_ts() + DEFAULT_LEASE_S, now, job_id))
+            (_now_ts() + MAX_LEASE_S, now, job_id))
         conn.commit()
         return {"status": "leased", "job_id": job_id,
                 "renews": int(row["renews"] or 0) + 1}
@@ -1557,6 +1617,8 @@ def status() -> dict[str, object]:
             "alternate_completed": int((alt_done["n"] if alt_done else 0) or 0),
             "alternate_quarantined": int(counts.get(ALT_QUARANTINED, 0) or 0),
             "terminal_skip": int(counts.get(TERMINAL_SKIP, 0) or 0),
+            "superseded": int(counts.get(SUPERSEDED, 0) or 0),
+            "max_lease_s": MAX_LEASE_S,
             "last_alternate_success_at": (alt_ok["at"] if alt_ok else None),
             "last_alternate_error": (
                 f"{alt_err['job_id'][:8]} {alt_err['event']} {alt_err['at']}:"

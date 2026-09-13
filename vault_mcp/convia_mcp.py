@@ -118,7 +118,7 @@ def list_pending(limit: int = 10, sources: list[str] | None = None) -> dict[str,
         except ConviaError:
             data["projection_bytes"] = None
         items.append(data)
-    total = convia_queue.status()["analysis_pending"]
+    total = convia_queue.pending_count()
     return {"pending_total": total, "returned": len(items), "items": items}
 
 
@@ -241,25 +241,34 @@ def prepare_analysis(
 
     entry = convia_queue.find_entry(relative, source_hash)
     if entry is not None and entry["status"] == "done":
-        raise ConviaError(
-            f"analyse déjà produite pour cette version : {entry['analysis_path']}"
-        )
+        # Rejeu d'un write dont la réponse s'est perdue : même identité logique, donc
+        # même résultat, pas une erreur. Une erreur ici était comptée comme un échec
+        # par le consommateur. Aucun second dépôt : le contenu rejoué n'est pas écrit.
+        return {
+            "duplicate": True,
+            "path": entry["analysis_path"],
+            "source_path": relative,
+            "source_hash": source_hash,
+        }
 
     agent = entry["source_agent"] if entry else Path(relative).parent.name
     session = entry["session_id"] if entry else ""
     title = entry["title"] if entry else ""
     target = analysis_path_for(relative, agent, title)
     return {
+        "duplicate": False,
         "path": target,
         "content": build_analysis_note(relative, source_hash, agent, session, title, markdown),
         "source_path": relative,
         "source_hash": source_hash,
+        "source_agent": agent,
     }
 
 
-def confirm_analysis(source_path: str, source_hash: str, analysis_path: str) -> bool:
+def confirm_analysis(source_path: str, source_hash: str, analysis_path: str,
+                     source_agent: str = "") -> bool:
     """Marque la file APRÈS un dépôt accepté, jamais avant."""
-    return convia_queue.mark_done(source_path, source_hash, analysis_path)
+    return convia_queue.mark_done(source_path, source_hash, analysis_path, source_agent)
 
 
 # ---------------------------------------------------------------- wiki_ingest_*

@@ -42,3 +42,6 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = "-q --strict-markers"
 pythonpath = ["."]
+markers = [
+  "e2e: serveur MCP reel en sous-processus, fault injection (tests/e2e)",
+]

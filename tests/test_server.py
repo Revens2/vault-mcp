@@ -152,4 +152,9 @@ def test_chemin_secret_derive_du_secret(serveur: Any) -> None:
 def test_application_construite_est_bien_protegee(serveur: Any) -> None:
     from vault_mcp.auth import Authentification
 
-    assert isinstance(serveur.construire_application(), Authentification)
+    from vault_mcp.telemetry import Telemetrie
+
+    application = serveur.construire_application()
+    # Le journal d appels enveloppe l authentification, il ne la remplace pas.
+    assert isinstance(application, Telemetrie)
+    assert isinstance(application._app, Authentification)

@@ -71,6 +71,16 @@ jobs:
       - name: Suite complete
         run: python -m pytest tests -q --ignore=tests/test_auth.py
 
+      # Pannes du consommateur ChatGPT (2026-09-12) : serveur MCP reel en
+      # sous-processus, consommateur tue aux frontieres claim/read/submit, reponse
+      # perdue, crash serveur. Rejoue 3 fois : un crash test vert une fois ne prouve
+      # rien sur une course. Aucun reseau externe, aucun LLM, aucun chemin de prod.
+      - name: E2E fault injection (x3)
+        run: |
+          for passe in 1 2 3; do
+            python -m pytest tests/e2e -m e2e -q || exit 1
+          done
+
   reproductible:
     name: Rebuild a hashes (arch de production)
     runs-on: ubuntu-24.04-arm
