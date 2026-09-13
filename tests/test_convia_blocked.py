@@ -162,3 +162,61 @@ def test_blocked_hides_legacy_older_pendings(env):
     mcp.mark_blocked(PATH, "ménage")
     assert queue.list_pending(limit=50) == []
     assert queue.pending_count() == 0
+
+
+# ---------------------------------------------------------------------------
+# Course list -> source modifiée -> mark (finding review post-merge PR #2) :
+# le hash épingle la version visée, un hash périmé refuse sans rien bloquer.
+# ---------------------------------------------------------------------------
+def test_race_old_hash_refuses_and_current_version_stays_pending(env):
+    """A(list, hash A) -> B(source modifiée + scan) -> mark_blocked(hash A) :
+    refus explicite, B reste pending, rien n'est bloqué, done intact."""
+    mcp, queue, conv = env
+    hash_a = queue.sha256_of(conv)
+    conv.write_text(RAW + "\n## 👤 User — 2026-09-02 09:00:00\n\nEt la suite ?\n",
+                    encoding="utf-8")
+    queue.scan()
+    hash_b = queue.sha256_of(conv)
+    assert hash_b != hash_a
+    with pytest.raises(mcp.ConviaError, match="périmé"):
+        mcp.mark_blocked(PATH, "refus qui concernait A", source_hash=hash_a)
+    items = queue.list_pending(limit=50)
+    assert [i.source_hash for i in items] == [hash_b]
+    st = queue.status()
+    assert st["analysis_blocked"] == 0 and st["analysis_done"] == 0
+    assert queue.blocked_events(PATH) == []
+
+
+def test_mark_with_matching_hash_blocks_the_intended_version(env):
+    mcp, queue, conv = env
+    digest = queue.sha256_of(conv)
+    out = mcp.mark_blocked(PATH, "épinglé", source_hash=digest)
+    assert out["blocked"] is True and out["source_hash"] == digest
+    assert queue.status()["analysis_blocked"] == 1
+
+
+def test_requeue_with_stale_hash_refuses_and_changes_nothing(env):
+    """A bloqué, puis B bloqué : requeue(hash A) vise l'unité parquée la plus
+    récente (B) -> refus, les deux restent bloquées, rien ne revient en file."""
+    mcp, queue, conv = env
+    hash_a = queue.sha256_of(conv)
+    mcp.mark_blocked(PATH, "A illisible", source_hash=hash_a)
+    conv.write_text(RAW + "\nsuite B\n", encoding="utf-8")
+    queue.scan()
+    hash_b = queue.sha256_of(conv)
+    mcp.mark_blocked(PATH, "B illisible", source_hash=hash_b)
+    with pytest.raises(mcp.ConviaError, match="périmé"):
+        mcp.requeue_blocked(PATH, source_hash=hash_a)
+    assert queue.list_pending(limit=50) == []
+    assert queue.status()["analysis_blocked"] == 2
+    assert queue.find_entry(PATH, hash_a)["status"] == "blocked"
+    assert queue.find_entry(PATH, hash_b)["status"] == "blocked"
+
+
+def test_requeue_with_matching_hash_requeues_only_it(env):
+    mcp, queue, conv = env
+    digest = queue.sha256_of(conv)
+    mcp.mark_blocked(PATH, "pause", source_hash=digest)
+    out = mcp.requeue_blocked(PATH, source_hash=digest)
+    assert out["requeued"] is True and out["source_hash"] == digest
+    assert [i.source_hash for i in queue.list_pending(limit=50)] == [digest]
