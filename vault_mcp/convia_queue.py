@@ -466,7 +466,8 @@ def mark_done(source_path: str, source_hash: str, analysis_path: str,
         conn.close()
 
 
-def mark_blocked(source_path: str, reason: str, actor: str = "") -> dict[str, object] | None:
+def mark_blocked(source_path: str, reason: str, actor: str = "",
+                 expected_hash: str = "") -> dict[str, object] | None:
     """Sort durablement une unité de la file : elle ne sera plus jamais servie.
 
     Ne touche ni au fichier source ni aux compteurs `done` : seule la ligne
@@ -475,6 +476,13 @@ def mark_blocked(source_path: str, reason: str, actor: str = "") -> dict[str, ob
     Les versions antérieures encore `pending` (file héritée) sont retirées
     comme `superseded` : le chemin ne doit plus rien exposer en tête de file.
     Rend la ligne bloquée, ou None si rien n'était en attente pour ce chemin.
+
+    `expected_hash` (le `hash` rendu par `list_pending`) épingle la version
+    visée : s'il ne correspond plus à la plus récente `pending` (source
+    modifiée entre le list et le refus de lecture), RIEN n'est bloqué et
+    QueueError est levée — bloquer la nouvelle version pour un refus qui
+    concernait l'ancienne serait exactement la perte que ce mécanisme
+    existe pour empêcher.
     """
     conn = connect()
     try:
@@ -486,6 +494,12 @@ def mark_blocked(source_path: str, reason: str, actor: str = "") -> dict[str, ob
         ).fetchone()
         if row is None:
             return None
+        if expected_hash and expected_hash != row["source_hash"]:
+            raise QueueError(
+                "hash périmé : la conversation a changé depuis le list "
+                f"(visé {expected_hash[:12]}…, actuel {row['source_hash'][:12]}…)."
+                " Relister avant de bloquer ; la version courante reste en file."
+            )
         now = _now()
         motif = (reason or "").strip()[:500]
         _supersede(conn, source_path, str(row["source_hash"]))
@@ -506,11 +520,17 @@ def mark_blocked(source_path: str, reason: str, actor: str = "") -> dict[str, ob
         conn.close()
 
 
-def requeue_blocked(source_path: str, actor: str = "") -> dict[str, object] | None:
+def requeue_blocked(source_path: str, actor: str = "",
+                    expected_hash: str = "") -> dict[str, object] | None:
     """Remet en file la dernière unité bloquée d'un chemin (admin / nouvel essai).
 
     La cause du blocage reste lisible (`blocked_reason`) : c'est l'historique,
     pas un état. Rend la ligne remise en file, ou None si rien n'était bloqué.
+
+    Même prudence qu'au blocage : `expected_hash` (le `hash` rendu par
+    `list_blocked`) épingle l'unité visée ; en cas de désaccord (nouvelle
+    version bloquée entre-temps), rien n'est remis en file et QueueError
+    est levée.
     """
     conn = connect()
     try:
@@ -522,6 +542,12 @@ def requeue_blocked(source_path: str, actor: str = "") -> dict[str, object] | No
         ).fetchone()
         if row is None:
             return None
+        if expected_hash and expected_hash != row["source_hash"]:
+            raise QueueError(
+                "hash périmé : l'unité bloquée a changé depuis le list "
+                f"(visé {expected_hash[:12]}…, actuel {row['source_hash'][:12]}…)."
+                " Relister avant de remettre en file."
+            )
         now = _now()
         conn.execute(
             "UPDATE pending_analysis SET status = 'pending' WHERE event_id = ?",

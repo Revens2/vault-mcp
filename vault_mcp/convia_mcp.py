@@ -272,11 +272,15 @@ def confirm_analysis(source_path: str, source_hash: str, analysis_path: str,
 
 
 # --------------------------------------------- convia_mark_blocked / requeue
-def mark_blocked(path: str, reason: str, actor: str = "chatgpt") -> dict[str, object]:
+def mark_blocked(path: str, reason: str, actor: str = "chatgpt",
+                 source_hash: str = "") -> dict[str, object]:
     """Sort durablement une conversation que le consommateur ne peut pas analyser.
 
-    `path` est celui rendu par `convia_list_pending_analysis` (aucun hash à
-    connaître : c'est la version en attente la plus récente qui est bloquée).
+    `path` est celui rendu par `convia_list_pending_analysis`, et `source_hash`
+    le `hash` qui l'accompagne : il épingle la version exacte en échec. Si la
+    source a changé entre-temps (hash périmé), RIEN n'est bloqué — relister
+    avant de re-tenter. Sans `source_hash`, c'est la version en attente la
+    plus récente qui est bloquée (comportement historique).
     `reason` est exigé : un blocage sans motif est un refus, pas une rustine.
     La source reste intacte, la ligne est conservée (`blocked`), l'action est
     auditée, et une requeue admin reste possible.
@@ -287,7 +291,11 @@ def mark_blocked(path: str, reason: str, actor: str = "chatgpt") -> dict[str, ob
         raise ConviaError("motif exigé : pourquoi cette conversation est-elle illisible ?")
     if len(motif) > 500:
         raise ConviaError("motif trop long : 500 caractères maximum")
-    res = convia_queue.mark_blocked(relative, motif, actor=actor)
+    try:
+        res = convia_queue.mark_blocked(relative, motif, actor=actor,
+                                        expected_hash=(source_hash or "").strip())
+    except convia_queue.QueueError as exc:
+        raise ConviaError(str(exc))
     if res is None:
         raise ConviaError(f"aucune analyse en attente pour : {relative}")
     return {"blocked": True, "path": res["source_path"],
@@ -295,10 +303,19 @@ def mark_blocked(path: str, reason: str, actor: str = "chatgpt") -> dict[str, ob
             "blocked_at": res["blocked_at"]}
 
 
-def requeue_blocked(path: str, actor: str = "admin") -> dict[str, object]:
-    """Remet en file une conversation bloquée (nouvel essai / cause réparée)."""
+def requeue_blocked(path: str, actor: str = "admin",
+                    source_hash: str = "") -> dict[str, object]:
+    """Remet en file une conversation bloquée (nouvel essai / cause réparée).
+
+    `source_hash` (le `hash` rendu par `convia_list_blocked`) épingle l'unité
+    visée : en cas de désaccord, rien n'est remis en file.
+    """
     relative = _check_namespace(path)
-    res = convia_queue.requeue_blocked(relative, actor=actor)
+    try:
+        res = convia_queue.requeue_blocked(relative, actor=actor,
+                                           expected_hash=(source_hash or "").strip())
+    except convia_queue.QueueError as exc:
+        raise ConviaError(str(exc))
     if res is None:
         raise ConviaError(f"aucune unité bloquée pour : {relative}")
     return {"requeued": True, "path": res["source_path"],

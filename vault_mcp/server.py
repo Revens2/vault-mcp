@@ -1192,12 +1192,15 @@ def convia_write_analysis(
 
 
 @mcp.tool()
-def convia_mark_blocked(path: str, reason: str) -> dict[str, object]:
+def convia_mark_blocked(path: str, reason: str, source_hash: str = "") -> dict[str, object]:
     """Durably park a conversation you definitively cannot read or analyse.
 
     Use the `path` returned by convia_list_pending_analysis — no hash needed,
     the newest pending version is parked. `reason` is required (e.g.
     "platform refusal on read", "projection unreadable after 3 attempts").
+    Pass `source_hash` (the `hash` from the same list entry) to pin the exact
+    version you failed on: if the source changed since, nothing is parked and
+    you get an explicit stale-hash refusal instead of parking the wrong version.
     The parked unit leaves the pending queue forever: it never comes back at
     the head of the backlog, the source file is untouched, nothing is deleted,
     the `done` counters are unchanged, and an admin can requeue it later.
@@ -1208,23 +1211,24 @@ def convia_mark_blocked(path: str, reason: str) -> dict[str, object]:
     if refus:
         return _erreur(refus)
     try:
-        return convia_mcp.mark_blocked(path, reason)
+        return convia_mcp.mark_blocked(path, reason, source_hash=source_hash or "")
     except (convia_mcp.ConviaError, OSError) as exc:
         return _erreur(f"ERREUR: {exc}")
 
 
 @mcp.tool()
-def convia_requeue_blocked(path: str) -> dict[str, object]:
+def convia_requeue_blocked(path: str, source_hash: str = "") -> dict[str, object]:
     """Put a parked (`blocked`) conversation back in the pending queue.
 
-    For a new attempt after the blocking cause was fixed. Requires
-    `mcp:ecriture`.
+    For a new attempt after the blocking cause was fixed. Pass `source_hash`
+    (the `hash` from convia_list_blocked) to pin the exact parked unit.
+    Requires `mcp:ecriture`.
     """
     refus = _exiger_ecriture()
     if refus:
         return _erreur(refus)
     try:
-        return convia_mcp.requeue_blocked(path)
+        return convia_mcp.requeue_blocked(path, source_hash=source_hash or "")
     except (convia_mcp.ConviaError, OSError) as exc:
         return _erreur(f"ERREUR: {exc}")
 
