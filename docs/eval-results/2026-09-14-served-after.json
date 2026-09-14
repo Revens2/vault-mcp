@@ -1,0 +1,436 @@
+{
+ "rapport": {
+  "hit@1": 0.675,
+  "hit@5": 0.875,
+  "hit@10": 0.9,
+  "mrr": 0.759,
+  "stale@5": 1,
+  "p50_ms": 293,
+  "p95_ms": 415,
+  "familles_hit@5": {
+   "current": "8/10",
+   "exact": "10/10",
+   "historique": "6/7",
+   "semantique": "11/13"
+  }
+ },
+ "statuts": {
+  "vault_status": {
+   "erreur": false,
+   "ms": 174,
+   "extrait": "{'ecriture_activee': True, 'spool': {'disponible': True, 'en_attente': 0, 'plus_vieux_s': None, 'echecs': 85, 'echecs_recents': 0, 'echec_recent_s': 364055.4, 'appliquees': 1877}, 'index_disponible': True, 'index_age_s': None, 'index_fragments': 244752, 'index_notes': 9785}"
+  },
+  "convia_status": {
+   "erreur": false,
+   "ms": 425,
+   "extrait": "{'analysis_version': 'convia-analysis-v1', 'analysis_pending': 777, 'analysis_done': 1417, 'analysis_superseded': 2158, 'analysis_blocked': 2, 'analysis_missing': 2, 'pending_by_source': {'agy-cli': 2, 'chatgpt-web': 23, 'claude-cli': 412, 'claude-desktop': 61, 'codex': 3, 'freebuff-desktop': 1, 'opencode': 275}, 'oldest_analysis_pending': {'created_at': '2026-09-06T13:52:52Z', 'source_path': 'raw"
+  },
+  "wiki_ingest_status": {
+   "erreur": false,
+   "ms": 55,
+   "extrait": "{'contract_version': 'wiki-extract-v4', 'tokenizer': 'local-cl100k-or-bytes4', 'pending_docs': 1789, 'pending_chunks': 1793, 'leased': 0, 'leased_expired': 0, 'submitted_spooled': 0, 'spool_files': 274, 'merged': 211, 'failed': 0, 'deferred': 0, 'quarantined': 0, 'alternate_pending': 0, 'alternate_leased': 0, 'alternate_completed': 8, 'alternate_quarantined': 0, 'terminal_skip': 0, 'superseded': 6"
+  }
+ },
+ "details": [
+  {
+   "id": 1,
+   "famille": "current",
+   "rang": 0,
+   "top3": [
+    "notes/infra/VPS-Etude-etat-reel.md",
+    "wiki/entities/vps-ia.md",
+    "raw/assets/ConvIA-Analysis/opencode/2026-09-10_contexte-vault-vps-etude-obsidian-context-retrie_ses_f738__analyse.md"
+   ]
+  },
+  {
+   "id": 2,
+   "famille": "current",
+   "rang": null,
+   "top3": [
+    "wiki/entities/VPS Étude Tailscale.md",
+    "wiki/entities/VPS Étude.md",
+    "wiki/concepts/iphone.md"
+   ]
+  },
+  {
+   "id": 3,
+   "famille": "current",
+   "rang": 0,
+   "top3": [
+    "notes/infra/Erratum-semgrep-pre-commit-vps-etude.md",
+    "notes/infra/VPS-Etude-etat-reel.md",
+    "wiki/entities/VPS allermarche.md"
+   ]
+  },
+  {
+   "id": 4,
+   "famille": "current",
+   "rang": null,
+   "top3": [
+    "wiki/sources/alertes-vulnerabilites-dette-technique-vps.md",
+    "wiki/sources/2026-08-13-verification-des-ports-ouverts-042cd584.md",
+    "notes/Coffre de secrets VPS etude - arbitrages et risques ouverts.md"
+   ]
+  },
+  {
+   "id": 5,
+   "famille": "current",
+   "rang": 0,
+   "top3": [
+    "notes/planning/CURRENT_STATE.md",
+    "notes/Automation_Planning_IA.md",
+    "notes/Planning_2026-09-06.md"
+   ]
+  },
+  {
+   "id": 6,
+   "famille": "current",
+   "rang": 0,
+   "top3": [
+    "notes/planning/CURRENT_STATE.md",
+    "wiki/entities/Google OAuth.md",
+    "notes/Automation_Planning_IA.md"
+   ]
+  },
+  {
+   "id": 7,
+   "famille": "current",
+   "rang": 0,
+   "top3": [
+    "notes/system/hardware/inventaire-materiel-titou.md",
+    "notes/Planning_2026-09-05_NAS.md",
+    "notes/Preferences_Planification_Titou.md"
+   ]
+  },
+  {
+   "id": 8,
+   "famille": "current",
+   "rang": 0,
+   "top3": [
+    "notes/system/hardware/inventaire-materiel-titou.md",
+    "wiki/concepts/pc-portable.md",
+    "wiki/entities/ASUS Vivobook X1505ZA.md"
+   ]
+  },
+  {
+   "id": 9,
+   "famille": "current",
+   "rang": 0,
+   "top3": [
+    "notes/Coffre de secrets VPS etude - architecture retenue.md",
+    "notes/Coffre de secrets VPS etude - arbitrages et risques ouverts.md",
+    "notes/Coffre de secrets VPS etude - threat model.md"
+   ]
+  },
+  {
+   "id": 10,
+   "famille": "current",
+   "rang": 3,
+   "top3": [
+    "notes/Coffre de secrets VPS etude - arbitrages et risques ouverts.md",
+    "notes/activity/daily/2026-09-10-analysis.md",
+    "Architecture/Hermes Agent - Capture Réseau & Synthèse de Skills API.md"
+   ]
+  },
+  {
+   "id": 11,
+   "famille": "exact",
+   "rang": 1,
+   "top3": [
+    "wiki/concepts/CVE-2025-14303.md",
+    "notes/Coffre de secrets VPS etude - architecture retenue.md",
+    "wiki/sources/2026-08-02-audit-securite-serveur-vps-f670819f.md"
+   ]
+  },
+  {
+   "id": 12,
+   "famille": "exact",
+   "rang": 2,
+   "top3": [
+    "wiki/entities/Google Drive.md",
+    "wiki/concepts/localStorage.md",
+    "notes/planning/CURRENT_STATE.md"
+   ]
+  },
+  {
+   "id": 13,
+   "famille": "exact",
+   "rang": 0,
+   "top3": [
+    "notes/VPS_IA.md",
+    "wiki/entities/llm-gateway.md",
+    "wiki/concepts/Inférence LLM locale.md"
+   ]
+  },
+  {
+   "id": 14,
+   "famille": "exact",
+   "rang": 1,
+   "top3": [
+    "notes/Coffre de secrets VPS etude - threat model.md",
+    "notes/infra/VPS-Etude-etat-reel.md",
+    "wiki/concepts/Default Deny.md"
+   ]
+  },
+  {
+   "id": 15,
+   "famille": "exact",
+   "rang": 0,
+   "top3": [
+    "notes/infra/VPS-Etude-etat-reel.md",
+    "wiki/entities/Rclone.md",
+    "wiki/concepts/Delta Sync.md"
+   ]
+  },
+  {
+   "id": 16,
+   "famille": "exact",
+   "rang": 0,
+   "top3": [
+    "wiki/entities/unattended-upgrades.md",
+    "wiki/entities/Ubuntu.md",
+    "wiki/sources/alertes-vulnerabilities-et-risque-de-blocage-lockout.md"
+   ]
+  },
+  {
+   "id": 17,
+   "famille": "exact",
+   "rang": 0,
+   "top3": [
+    "notes/infra/VPS-Etude-etat-reel.md",
+    "wiki/entities/Unreal Engine 5.8.md",
+    "wiki/concepts/Intel Management Engine.md"
+   ]
+  },
+  {
+   "id": 18,
+   "famille": "exact",
+   "rang": 0,
+   "top3": [
+    "notes/planning/CURRENT_STATE.md",
+    "notes/activity/aw/2026-09-12.md",
+    "wiki/entities/Version 7D88v1G.md"
+   ]
+  },
+  {
+   "id": 19,
+   "famille": "exact",
+   "rang": 0,
+   "top3": [
+    "notes/VPS_IA.md",
+    "wiki/entities/VPS IA.md",
+    "wiki/concepts/Zone Discount.md"
+   ]
+  },
+  {
+   "id": 20,
+   "famille": "exact",
+   "rang": 0,
+   "top3": [
+    "notes/system/hardware/inventaire-materiel-titou.md",
+    "wiki/concepts/Raptor Lake.md",
+    "Architecture/Hermes Agent - Capture Réseau & Synthèse de Skills API.md"
+   ]
+  },
+  {
+   "id": 21,
+   "famille": "semantique",
+   "rang": 0,
+   "top3": [
+    "notes/VPS_IA.md",
+    "wiki/sources/vps-ia-infrastructure-gemma4.md",
+    "wiki/sources/deploiement-passerelle-switch-vram-vps.md"
+   ]
+  },
+  {
+   "id": 22,
+   "famille": "semantique",
+   "rang": 0,
+   "top3": [
+    "notes/Planning_2026-09-05_NAS.md",
+    "notes/Convention_Couleurs_Google_Calendar.md",
+    "notes/activity/daily/2026-09-07-analysis.md"
+   ]
+  },
+  {
+   "id": 23,
+   "famille": "semantique",
+   "rang": 0,
+   "top3": [
+    "notes/Creation_VPS_Oracle_Always_Free.md",
+    "wiki/entities/Oracle Cloud Infrastructure.md",
+    "wiki/entities/Serveur ARM Ampere.md"
+   ]
+  },
+  {
+   "id": 24,
+   "famille": "semantique",
+   "rang": 2,
+   "top3": [
+    "wiki/entities/MetaTrader 5.md",
+    "wiki/sources/execution-multi-instance-metatrader-5.md",
+    "wiki/sources/solutions-multi-comptes-metatrader-5.md"
+   ]
+  },
+  {
+   "id": 25,
+   "famille": "semantique",
+   "rang": 0,
+   "top3": [
+    "notes/Architecture_BDD_SaaS_CYNA_Symfony.md",
+    "wiki/entities/CYNA.md",
+    "wiki/entities/CYNA DEV.md"
+   ]
+  },
+  {
+   "id": 26,
+   "famille": "semantique",
+   "rang": 0,
+   "top3": [
+    "notes/Convention_Couleurs_Google_Calendar.md",
+    "notes/Automation_Planning_IA.md",
+    "wiki/entities/Google Calendar.md"
+   ]
+  },
+  {
+   "id": 27,
+   "famille": "semantique",
+   "rang": 0,
+   "top3": [
+    "wiki/concepts/GGUF.md",
+    "wiki/concepts/Quantification.md",
+    "wiki/entities/Quantification GGUF.md"
+   ]
+  },
+  {
+   "id": 28,
+   "famille": "semantique",
+   "rang": 1,
+   "top3": [
+    "wiki/concepts/Haute disponibilité.md",
+    "wiki/sources/2026-08-22-netbird-multi-vps-deploiement-ha-c885406e.md",
+    "raw/assets/ConvIA-Analysis/Claude-Desktop/2026-08-22_netbird-multi-vps-deploiement-ha_c885406e__analyse.md"
+   ]
+  },
+  {
+   "id": 29,
+   "famille": "semantique",
+   "rang": 8,
+   "top3": [
+    "notes/planning/reconciliation/2026-09-06-review.md",
+    "notes/activity/daily/2026-09-06-analysis.md",
+    "wiki/entities/ConvIA.md"
+   ]
+  },
+  {
+   "id": 30,
+   "famille": "semantique",
+   "rang": null,
+   "top3": [
+    "wiki/entities/PAM (Pluggable Authentication Modules).md",
+    "wiki/entities/Google Authenticator.md",
+    "wiki/concepts/Double Authentification (MFA).md"
+   ]
+  },
+  {
+   "id": 31,
+   "famille": "semantique",
+   "rang": 0,
+   "top3": [
+    "notes/Preferences_Planification_Titou.md",
+    "wiki/sources/au-lieu-de-planifier-lexecution-dun-script-fige-tu-planifies.md",
+    "CV - Intégrateur IA - contenu.md"
+   ]
+  },
+  {
+   "id": 32,
+   "famille": "semantique",
+   "rang": 0,
+   "top3": [
+    "Architecture/Hermes Agent - Capture Réseau & Synthèse de Skills API.md",
+    "wiki/concepts/Reverse Engineering API.md",
+    "wiki/sources/2026-08-13-adaptation-extraction-reseau-hermes-agent-20a8a6dd.md"
+   ]
+  },
+  {
+   "id": 33,
+   "famille": "semantique",
+   "rang": 0,
+   "top3": [
+    "notes/Coffre de secrets VPS etude - threat model.md",
+    "notes/Coffre de secrets VPS etude - architecture retenue.md",
+    "notes/Coffre de secrets VPS etude - arbitrages et risques ouverts.md"
+   ]
+  },
+  {
+   "id": 34,
+   "famille": "historique",
+   "rang": 1,
+   "top3": [
+    "notes/planning/reconciliation/2026-09-06-review.md",
+    "notes/planning/reconciliation/2026-09-09-review.md",
+    "notes/planning/reconciliation/2026-09-07-review.md"
+   ]
+  },
+  {
+   "id": 35,
+   "famille": "historique",
+   "rang": 0,
+   "top3": [
+    "notes/infra/Erratum-semgrep-pre-commit-vps-etude.md",
+    "raw/assets/ConvIA/Freebuff-Desktop/2026-08-30_deploiement-pre-commit-semgrep-global_5abf3df5.md",
+    "raw/assets/ConvIA-Analysis/Freebuff-Desktop/2026-08-30_deploiement-pre-commit-semgrep-global_5abf3df5__analyse.md"
+   ]
+  },
+  {
+   "id": 36,
+   "famille": "historique",
+   "rang": 0,
+   "top3": [
+    "raw/assets/ConvIA-Analysis/Claude-CLI/2026-08-28_audit-vps-netbird_6af07892__analyse.md",
+    "raw/assets/ConvIA-Analysis/Claude-Desktop/2026-08-28_audit-vps-netbird_6af07892__analyse.md",
+    "raw/assets/ConvIA-Analysis/Claude-Desktop/2026-08-28_audit-vps-netbird_8f3397d0__analyse.md"
+   ]
+  },
+  {
+   "id": 37,
+   "famille": "historique",
+   "rang": 0,
+   "top3": [
+    "raw/assets/ConvIA-Analysis/Claude-CLI/2026-09-10_netbird-dns-access-error_a36f6e4c__analyse.md",
+    "raw/assets/ConvIA-Analysis/AGY-CLI/2026-08-28_depannage-netbird-acces-iis_48565f84__analyse.md",
+    "raw/assets/ConvIA/AGY-CLI/2026-09-04_caveman-ultra-pk-je-vois-pas-les-disuqe-reseau-s_2cdd8004.md"
+   ]
+  },
+  {
+   "id": 38,
+   "famille": "historique",
+   "rang": 0,
+   "top3": [
+    "raw/assets/ConvIA-Analysis/Claude-Desktop/2026-09-09_replication-arion-candidat-gele_cd7a0755__analyse.md",
+    "wiki/concepts/Stratégie de Gestion de Contexte à 3 Niveaux.md",
+    "wiki/concepts/LLM Wiki Agent.md"
+   ]
+  },
+  {
+   "id": 39,
+   "famille": "historique",
+   "rang": null,
+   "top3": [
+    "wiki/entities/Aider.md",
+    "notes/activity/daily/2026-09-06-analysis.md",
+    "notes/planning/reconciliation/2026-09-09-review.md"
+   ]
+  },
+  {
+   "id": 40,
+   "famille": "historique",
+   "rang": 2,
+   "top3": [
+    "raw/assets/ConvIA-Analysis/opencode/2026-09-10_activitywatch-current-docs-docs-fetcher-subagent_ses_f732__analyse.md",
+    "raw/assets/ConvIA/OpenCode/2026-09-10_minimal-plan-aw-deployment-planificateur-subagen_ses_f731.md",
+    "notes/activity/aw/2026-09-13.md"
+   ]
+  }
+ ]
+}

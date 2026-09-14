@@ -1,0 +1,436 @@
+{
+ "rapport": {
+  "hit@1": 0.325,
+  "hit@5": 0.625,
+  "hit@10": 0.75,
+  "mrr": 0.465,
+  "stale@5": 1,
+  "p50_ms": 2542,
+  "p95_ms": 3707,
+  "familles_hit@5": {
+   "current": "6/10",
+   "exact": "6/10",
+   "historique": "5/7",
+   "semantique": "8/13"
+  }
+ },
+ "statuts": {
+  "vault_status": {
+   "erreur": false,
+   "ms": 94,
+   "extrait": "{'ecriture_activee': True, 'spool': {'disponible': True, 'en_attente': 0, 'plus_vieux_s': None, 'echecs': 85, 'echecs_recents': 0, 'echec_recent_s': 363531.1, 'appliquees': 1877}, 'index_disponible': True, 'index_age_s': None, 'index_fragments': 244752, 'index_notes': 9785}"
+  },
+  "convia_status": {
+   "erreur": false,
+   "ms": 192,
+   "extrait": "{'analysis_version': 'convia-analysis-v1', 'analysis_pending': 750, 'analysis_done': 1417, 'analysis_superseded': 2154, 'analysis_blocked': 2, 'analysis_missing': 2, 'pending_by_source': {'agy-cli': 1, 'chatgpt-web': 23, 'claude-cli': 397, 'claude-desktop': 61, 'codex': 2, 'freebuff-desktop': 1, 'opencode': 265}, 'oldest_analysis_pending': {'created_at': '2026-09-06T13:52:52Z', 'source_path': 'raw"
+  },
+  "wiki_ingest_status": {
+   "erreur": false,
+   "ms": 53,
+   "extrait": "{'contract_version': 'wiki-extract-v4', 'tokenizer': 'local-cl100k-or-bytes4', 'pending_docs': 1789, 'pending_chunks': 1793, 'leased': 0, 'leased_expired': 0, 'submitted_spooled': 0, 'spool_files': 274, 'merged': 211, 'failed': 0, 'deferred': 0, 'quarantined': 0, 'alternate_pending': 0, 'alternate_leased': 0, 'alternate_completed': 8, 'alternate_quarantined': 0, 'terminal_skip': 0, 'superseded': 6"
+  }
+ },
+ "details": [
+  {
+   "id": 1,
+   "famille": "current",
+   "rang": null,
+   "top3": [
+    ".trash-wiki-publish/20260906T170555Z/entities/VPS Étude.md",
+    ".trash-wiki-publish/20260906T172856Z/entities/VPS Étude.md",
+    ".trash-wiki-publish/20260906T170555Z/entities/VPS Colab.md"
+   ]
+  },
+  {
+   "id": 2,
+   "famille": "current",
+   "rang": null,
+   "top3": [
+    ".trash-wiki-publish/20260906T170555Z/entities/VPS Étude.md",
+    ".trash-wiki-publish/20260906T172856Z/entities/VPS Étude.md",
+    ".trash-wiki-publish/20260906T170555Z/entities/Tailscale.md"
+   ]
+  },
+  {
+   "id": 3,
+   "famille": "current",
+   "rang": 0,
+   "top3": [
+    "notes/infra/Erratum-semgrep-pre-commit-vps-etude.md",
+    "raw/assets/ConvIA/Claude-Desktop/2026-09-12_mcp-chatgpt-orchestrateur-d-agents-ia_0504a306.md",
+    "wiki/sources/mission-de-securite-et-durcissement-secops-sur-le-vps-de-pro.md"
+   ]
+  },
+  {
+   "id": 4,
+   "famille": "current",
+   "rang": null,
+   "top3": [
+    "wiki/sources/audit-durcissement-securite-vps-etude-vps-ia.md",
+    "wiki/sources/alertes-vulnerabilites-dette-technique-vps.md",
+    "wiki/sources/cest-meme-une-excellente-question-car-ouvrir-des-ports-port.md"
+   ]
+  },
+  {
+   "id": 5,
+   "famille": "current",
+   "rang": 1,
+   "top3": [
+    "wiki/concepts/State Management.md",
+    "notes/planning/CURRENT_STATE.md",
+    "wiki/sources/2026-08-13-planification-mise-en-veille-6ffc4bb4.md"
+   ]
+  },
+  {
+   "id": 6,
+   "famille": "current",
+   "rang": 1,
+   "top3": [
+    "wiki/entities/Google OAuth.md",
+    "notes/planning/CURRENT_STATE.md",
+    "wiki/concepts/Service Auth.md"
+   ]
+  },
+  {
+   "id": 7,
+   "famille": "current",
+   "rang": 1,
+   "top3": [
+    "wiki/sources/canary-pont-wiki-drive-e2e-9f3c71d2.md",
+    "notes/system/hardware/inventaire-materiel-titou.md",
+    "wiki/sources/je-nai-aucun-acces-physique-ou-reseau-a-tes-machines-je-ne-p.md"
+   ]
+  },
+  {
+   "id": 8,
+   "famille": "current",
+   "rang": 0,
+   "top3": [
+    "notes/system/hardware/inventaire-materiel-titou.md",
+    "raw/assets/Alerte de Dette Technique et de Sécurité.md",
+    "wiki/sources/voici-la-liste-des-mcp-les-plus-pertinents-a-integrer-a-votr.md"
+   ]
+  },
+  {
+   "id": 9,
+   "famille": "current",
+   "rang": 0,
+   "top3": [
+    "notes/Coffre de secrets VPS etude - architecture retenue.md",
+    "raw/assets/Coffre de secrets VPS etude - architecture retenue.md",
+    "raw/assets/ConvIA-Analysis/Claude-Desktop/2026-09-05_self-hosted-secrets-vault-pour-agents-ia_b4fe8a68__analyse.md"
+   ]
+  },
+  {
+   "id": 10,
+   "famille": "current",
+   "rang": null,
+   "top3": [
+    "raw/assets/ConvIA/AGY-CLI/2026-08-15_appelle-l-outil-mcp-search-vault-du-serveur-vaul_b9534e44.md",
+    "raw/assets/ConvIA/Freebuff/2026-08-15_spawn-le-sub-agent-obsidian-pour-consulter-mon-r_860c5f34.md",
+    "raw/assets/ConvIA-Analysis/AGY-CLI/2026-09-06_troubleshooting-mcp-vault-connection_3eb177f0__analyse.md"
+   ]
+  },
+  {
+   "id": 11,
+   "famille": "exact",
+   "rang": null,
+   "top3": [
+    "wiki/concepts/CVE-2025-14303.md",
+    "raw/assets/ConvIA/AGY-CLI/2026-08-02_audit-securite-serveur-vps_6e0ad3d3.md",
+    "wiki/sources/2026-08-12-test-de-sante-vps-ia-c6633ace.md"
+   ]
+  },
+  {
+   "id": 12,
+   "famille": "exact",
+   "rang": null,
+   "top3": [
+    ".trash-wiki-publish/20260906T170555Z/entities/Google Drive.md",
+    ".trash-wiki-publish/20260906T172856Z/entities/Google Drive.md",
+    ".trash-wiki-publish/20260906T170555Z/concepts/Période de conservation.md"
+   ]
+  },
+  {
+   "id": 13,
+   "famille": "exact",
+   "rang": 0,
+   "top3": [
+    "wiki/entities/llm-gateway.md",
+    "notes/VPS_IA.md",
+    "wiki/concepts/API Gateway.md"
+   ]
+  },
+  {
+   "id": 14,
+   "famille": "exact",
+   "rang": null,
+   "top3": [
+    "wiki/concepts/Default Deny.md",
+    "raw/assets/ConvIA/ChatGPT-Web/2026-09-09_cartographier-le-vps_6aa184a4.md",
+    "wiki/sources/toutefois-larchitecture-actuelle-presente-des-vulnerabilites.md"
+   ]
+  },
+  {
+   "id": 15,
+   "famille": "exact",
+   "rang": 1,
+   "top3": [
+    ".trash-wiki-publish/20260906T170555Z/entities/Obsidian LiveSync.md",
+    "notes/infra/VPS-Etude-etat-reel.md",
+    ".trash-wiki-publish/20260906T172856Z/entities/Obsidian LiveSync.md"
+   ]
+  },
+  {
+   "id": 16,
+   "famille": "exact",
+   "rang": 0,
+   "top3": [
+    "wiki/entities/unattended-upgrades.md",
+    ".trash-wiki-publish/20260906T170555Z/sources/Creation_VPS_Oracle_Always_Free.md",
+    "wiki/sources/alertes-vulnerabilities-et-risque-de-blocage-lockout.md"
+   ]
+  },
+  {
+   "id": 17,
+   "famille": "exact",
+   "rang": 1,
+   "top3": [
+    "wiki/sources/error-response-from-daemon-failed-to-set-up-container-networ-1.md",
+    "notes/infra/VPS-Etude-etat-reel.md",
+    "wiki/sources/error-response-from-daemon-failed-to-set-up-container-networ.md"
+   ]
+  },
+  {
+   "id": 18,
+   "famille": "exact",
+   "rang": 1,
+   "top3": [
+    "raw/assets/ConvIA/Freebuff-CLI/2026-09-09_allo_c28262d1.md",
+    "notes/planning/CURRENT_STATE.md",
+    "raw/assets/ConvIA/AGY-CLI/2026-09-02_list-available-system-subagents_43bf9ec8.md"
+   ]
+  },
+  {
+   "id": 19,
+   "famille": "exact",
+   "rang": 7,
+   "top3": [
+    "wiki/sources/impact-de-la-conversion-en-entiers-centimes-la-modification.md",
+    ".trash-wiki-publish/20260906T170555Z/entities/VPS IA.md",
+    ".trash-wiki-publish/20260906T170555Z/entities/VPS Étude.md"
+   ]
+  },
+  {
+   "id": 20,
+   "famille": "exact",
+   "rang": 0,
+   "top3": [
+    "notes/system/hardware/inventaire-materiel-titou.md",
+    "raw/assets/ConvIA/Freebuff-Desktop/2026-08-31_crack-bios-verrouille-nas-pc_43340f5e.md",
+    "raw/assets/ConvIA-Analysis/Freebuff-Desktop/2026-08-31_crack-bios-verrouille-nas-pc_43340f5e__analyse.md"
+   ]
+  },
+  {
+   "id": 21,
+   "famille": "semantique",
+   "rang": 5,
+   "top3": [
+    "wiki/sources/diagnostic-optimisation-llama-server-vps.md",
+    "wiki/sources/mise-a-jour-qwen-monitoring-vps.md",
+    "wiki/sources/vps-ia-infrastructure-gemma4.md"
+   ]
+  },
+  {
+   "id": 22,
+   "famille": "semantique",
+   "rang": 0,
+   "top3": [
+    "notes/Planning_2026-09-05_NAS.md",
+    "raw/assets/1 Identifier les composants clés dune architecture et dune s.md",
+    "wiki/sources/conformement-a-vos-consignes-de-sauvegarde-automatique-je-va.md"
+   ]
+  },
+  {
+   "id": 23,
+   "famille": "semantique",
+   "rang": null,
+   "top3": [
+    "wiki/sources/oracle-cloud-a-une-offre-always-free-toujours-gratuit-tres-g.md",
+    ".trash-wiki-publish/20260906T170555Z/entities/Rescue-Temp.md",
+    ".trash-wiki-publish/20260906T172856Z/entities/Rescue-Temp.md"
+   ]
+  },
+  {
+   "id": 24,
+   "famille": "semantique",
+   "rang": null,
+   "top3": [
+    ".trash-wiki-publish/20260906T170555Z/sources/1-rechercher-les-methodes-techniques-pour-executer-plusieurs.md",
+    "raw/assets/1 Rechercher les méthodes techniques pour exécuter plusieurs.md",
+    "wiki/sources/1-rechercher-les-methodes-techniques-pour-executer-plusieurs.md"
+   ]
+  },
+  {
+   "id": 25,
+   "famille": "semantique",
+   "rang": 0,
+   "top3": [
+    "notes/Architecture_BDD_SaaS_CYNA_Symfony.md",
+    "raw/assets/Architecture_BDD_SaaS_CYNA_Symfony.md",
+    ".trash-wiki-publish/20260906T170555Z/sources/Architecture_BDD_SaaS_CYNA_Symfony.md"
+   ]
+  },
+  {
+   "id": 26,
+   "famille": "semantique",
+   "rang": 2,
+   "top3": [
+    "raw/assets/ConvIA-Analysis/Claude-Desktop/2026-09-05_google-calendar-api-setup_8be9390a__analyse.md",
+    "wiki/entities/Google Calendar.md",
+    "notes/Convention_Couleurs_Google_Calendar.md"
+   ]
+  },
+  {
+   "id": 27,
+   "famille": "semantique",
+   "rang": 6,
+   "top3": [
+    ".trash-wiki-publish/20260906T170555Z/concepts/Quantification.md",
+    ".trash-wiki-publish/20260906T172856Z/concepts/Quantification.md",
+    "raw/assets/Objectif de la recherche  Trouver des données concrètes et d.md"
+   ]
+  },
+  {
+   "id": 28,
+   "famille": "semantique",
+   "rang": 0,
+   "top3": [
+    "wiki/sources/2026-08-22-netbird-multi-vps-deploiement-ha-c885406e.md",
+    "raw/assets/ConvIA-Analysis/Claude-CLI/2026-08-28_audit-vps-netbird_6af07892__analyse.md",
+    "raw/assets/ConvIA-Analysis/Claude-Desktop/2026-08-22_netbird-multi-vps-deploiement-ha_c885406e__analyse.md"
+   ]
+  },
+  {
+   "id": 29,
+   "famille": "semantique",
+   "rang": 1,
+   "top3": [
+    "wiki/entities/ConvIA.md",
+    "wiki/sources/cloture-production-convia-spool-non-bloquant-mcp-chatgpt.md",
+    "wiki/entities/Vault.md"
+   ]
+  },
+  {
+   "id": 30,
+   "famille": "semantique",
+   "rang": 6,
+   "top3": [
+    ".trash-wiki-publish/20260906T170555Z/sources/1-parametrage-a2f-dansetcpamdsshd.md",
+    "wiki/entities/PAM (Pluggable Authentication Modules).md",
+    "wiki/concepts/Authentification SSH.md"
+   ]
+  },
+  {
+   "id": 31,
+   "famille": "semantique",
+   "rang": 0,
+   "top3": [
+    "notes/Preferences_Planification_Titou.md",
+    "wiki/sources/au-lieu-de-planifier-lexecution-dun-script-fige-tu-planifies.md",
+    "raw/assets/Analyse Stratégique_5.md"
+   ]
+  },
+  {
+   "id": 32,
+   "famille": "semantique",
+   "rang": 3,
+   "top3": [
+    ".trash-wiki-publish/20260906T170555Z/sources/Hermes Agent Masterclass.md",
+    ".trash-wiki-publish/20260906T170555Z/sources/How to Become a Hermes Agent Operator.md",
+    "wiki/sources/2026-08-13-adaptation-extraction-reseau-hermes-agent-20a8a6dd.md"
+   ]
+  },
+  {
+   "id": 33,
+   "famille": "semantique",
+   "rang": 0,
+   "top3": [
+    "notes/Coffre de secrets VPS etude - threat model.md",
+    "raw/assets/Coffre de secrets VPS etude - threat model.md",
+    "wiki/sources/conformement-aux-principes-de-defense-en-profondeur-et-de-ze.md"
+   ]
+  },
+  {
+   "id": 34,
+   "famille": "historique",
+   "rang": 4,
+   "top3": [
+    "notes/planning/reconciliation/2026-09-07-review.md",
+    "wiki/sources/lanalyse-de-votre-capture-decran-revele-une-fuite-de-contene.md",
+    "notes/planning/reconciliation/2026-09-08-review.md"
+   ]
+  },
+  {
+   "id": 35,
+   "famille": "historique",
+   "rang": 0,
+   "top3": [
+    "notes/infra/Erratum-semgrep-pre-commit-vps-etude.md",
+    "raw/assets/ConvIA-Analysis/Freebuff-Desktop/2026-08-30_deploiement-pre-commit-semgrep-global_5abf3df5__analyse.md",
+    "wiki/sources/dette-technique-desynchronisation-detat-annuler-un-commit-g.md"
+   ]
+  },
+  {
+   "id": 36,
+   "famille": "historique",
+   "rang": 2,
+   "top3": [
+    "wiki/sources/2026-08-10-audit-infrastructure-reseau-vps-65a6d71f.md",
+    "raw/assets/ConvIA/Claude-Desktop/2026-08-28_audit-vps-netbird_6af07892.md",
+    "raw/assets/ConvIA-Analysis/Claude-CLI/2026-08-28_audit-vps-netbird_6af07892__analyse.md"
+   ]
+  },
+  {
+   "id": 37,
+   "famille": "historique",
+   "rang": 5,
+   "top3": [
+    "wiki/entities/DNS.md",
+    "raw/assets/ConvIA-Analysis/Claude-Desktop/2026-08-28_audit-vps-netbird_fef8110a__analyse.md",
+    "raw/assets/ConvIA-Analysis/AGY-CLI/2026-09-04_caveman-ultra-pk-je-vois-pas-les-disuqe-reseau-s_2cdd8004__analyse.md"
+   ]
+  },
+  {
+   "id": 38,
+   "famille": "historique",
+   "rang": 0,
+   "top3": [
+    "raw/assets/ConvIA-Analysis/Claude-Desktop/2026-09-09_replication-arion-candidat-gele_cd7a0755__analyse.md",
+    "wiki/concepts/LLM Wiki Agent.md",
+    "raw/assets/ConvIA/Claude-Desktop/2026-09-09_replication-arion-candidat-gele_cd7a0755.md"
+   ]
+  },
+  {
+   "id": 39,
+   "famille": "historique",
+   "rang": 3,
+   "top3": [
+    "wiki/sources/ia-developpement-avance-agents-orchestration-llms-locaux.md",
+    "raw/assets/ConvIA/OpenCode/2026-09-12_new-session-2026-09-12t18-14-04-102z_ses_f692.md",
+    "wiki/sources/thought-process-initialisation-de-lorchestrateur-aucun-etat.md"
+   ]
+  },
+  {
+   "id": 40,
+   "famille": "historique",
+   "rang": null,
+   "top3": [
+    "raw/assets/ConvIA-Analysis/opencode/2026-09-10_activitywatch-current-docs-docs-fetcher-subagent_ses_f732__analyse.md",
+    "raw/assets/ConvIA/AGY-Desktop/_attachments/134e9b0d-12fd-47c0-9c29-be8d1175adb8/learning_proposal.md",
+    "wiki/sources/2026-08-13-audit-conformite-aaa-watchy-85e6492d.md"
+   ]
+  }
+ ]
+}
