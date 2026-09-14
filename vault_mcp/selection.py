@@ -19,6 +19,9 @@ EXCLUS = (
     ".trash-mcp/",
     ".obsidian/",
     ".trash/",
+    # Corbeille de la publication Wiki : 2 065 fragments indexes au 2026-09-14, qui
+    # remontaient devant les fiches vivantes (`entities/VPS Étude.md` supprimee).
+    ".trash-wiki-publish/",
     ".temp/",
     ".git/",
     ".staging/",

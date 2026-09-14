@@ -1,0 +1,40 @@
+{"id": 1, "famille": "current", "q": "état actuel du réseau overlay du VPS Étude", "attendus": ["notes/infra/VPS-Etude-etat-reel.md"], "perimes": ["wiki/entities/VPS Étude Tailscale.md", "raw/assets/ConvIA/"]}
+{"id": 2, "famille": "current", "q": "IP Tailscale du VPS etude", "attendus": ["notes/infra/VPS-Etude-etat-reel.md"], "perimes": ["wiki/entities/VPS Étude Tailscale.md"]}
+{"id": 3, "famille": "current", "q": "semgrep pre-commit est-il déployé sur le VPS etude", "attendus": ["notes/infra/Erratum-semgrep-pre-commit-vps-etude.md", "notes/infra/VPS-Etude-etat-reel.md"], "perimes": ["raw/assets/ConvIA/", "raw/assets/ConvIA-Analysis/"]}
+{"id": 4, "famille": "current", "q": "quels ports UFW sont ouverts sur vps-etude", "attendus": ["notes/infra/VPS-Etude-etat-reel.md"], "perimes": ["raw/assets/ConvIA/"]}
+{"id": 5, "famille": "current", "q": "état courant du planning IA", "attendus": ["notes/planning/CURRENT_STATE.md"], "perimes": ["notes/planning/reconciliation/"]}
+{"id": 6, "famille": "current", "q": "tâche active régénérer les secrets Google OAuth exposés", "attendus": ["notes/planning/CURRENT_STATE.md"], "perimes": []}
+{"id": 7, "famille": "current", "q": "quelle machine sert de NAS à Titou", "attendus": ["notes/system/hardware/inventaire-materiel-titou.md"], "perimes": []}
+{"id": 8, "famille": "current", "q": "caractéristiques du PC portable principal de Titou", "attendus": ["notes/system/hardware/inventaire-materiel-titou.md"], "perimes": []}
+{"id": 9, "famille": "current", "q": "coffre de secrets retenu pour les agents IA Vaultwarden et broker", "attendus": ["notes/Coffre de secrets VPS etude"], "perimes": []}
+{"id": 10, "famille": "current", "q": "outils exposés par le serveur Vault MCP", "attendus": ["wiki/entities/Vault MCP.md"], "perimes": []}
+{"id": 11, "famille": "exact", "q": "CVE-2026-43912", "attendus": ["notes/Coffre de secrets VPS etude"], "perimes": []}
+{"id": 12, "famille": "exact", "q": "restore-storage.service", "attendus": ["notes/planning/CURRENT_STATE.md", "notes/activity/daily/2026-09-14-analysis.md"], "perimes": []}
+{"id": 13, "famille": "exact", "q": "llm-gateway.service", "attendus": ["notes/VPS_IA.md", "wiki/entities/llm-gateway.md", "wiki/sources/VPS_IA.md", "wiki/sources/deploiement-passerelle-switch-vram-vps.md", "wiki/sources/devops-llm-optimisation-contexte-vram.md"], "perimes": []}
+{"id": 14, "famille": "exact", "q": "ProtectSystem=strict", "attendus": ["notes/infra/VPS-Etude-etat-reel.md"], "perimes": []}
+{"id": 15, "famille": "exact", "q": "mirror-sync.service", "attendus": ["notes/infra/VPS-Etude-etat-reel.md"], "perimes": []}
+{"id": 16, "famille": "exact", "q": "unattended-upgrades", "attendus": ["wiki/entities/unattended-upgrades.md", "wiki/sources/ssh-2fa-unattended-upgrades-et-fim.md", "wiki/sources/parametrage-a2f-ssh-pam.md", "notes/Creation_VPS_Oracle_Always_Free.md"], "perimes": []}
+{"id": 17, "famille": "exact", "q": "enp0s6 10.0.0.80", "attendus": ["notes/infra/VPS-Etude-etat-reel.md"], "perimes": []}
+{"id": 18, "famille": "exact", "q": "c922c5b3eac14432a5bd9402dd397227", "attendus": ["notes/planning/CURRENT_STATE.md"], "perimes": []}
+{"id": 19, "famille": "exact", "q": "100.99.75.104", "attendus": ["notes/VPS_IA.md", "wiki/sources/VPS_IA.md"], "perimes": []}
+{"id": 20, "famille": "exact", "q": "Lenovo 14w Gen 2", "attendus": ["notes/system/hardware/inventaire-materiel-titou.md"], "perimes": []}
+{"id": 21, "famille": "semantique", "q": "architecture du VPS IA avec llama-server, LiteLLM et switch VRAM", "attendus": ["notes/VPS_IA.md", "wiki/sources/VPS_IA.md", "wiki/sources/deploiement-passerelle-switch-vram-vps.md", "wiki/entities/llm-gateway.md"], "perimes": []}
+{"id": 22, "famille": "semantique", "q": "installer physiquement le NAS au sous-sol et finir la stack", "attendus": ["notes/Planning_2026-09-05_NAS.md"], "perimes": []}
+{"id": 23, "famille": "semantique", "q": "créer une instance Oracle Cloud Always Free", "attendus": ["notes/Creation_VPS_Oracle_Always_Free.md", "wiki/concepts/Always Free.md"], "perimes": []}
+{"id": 24, "famille": "semantique", "q": "gérer plusieurs comptes MetaTrader 5 en parallèle", "attendus": ["wiki/sources/architecture-trading-multi", "wiki/sources/solutions-multi-comptes-metatrader-5.md", "wiki/sources/architecture-multi-comptes-metatrader-5.md"], "perimes": []}
+{"id": 25, "famille": "semantique", "q": "schéma de base de données du SaaS CYNA sous Symfony", "attendus": ["notes/Architecture_BDD_SaaS_CYNA_Symfony.md"], "perimes": []}
+{"id": 26, "famille": "semantique", "q": "quelle couleur utiliser pour chaque type d'événement dans Google Calendar", "attendus": ["notes/Convention_Couleurs_Google_Calendar.md"], "perimes": []}
+{"id": 27, "famille": "semantique", "q": "formats de quantification des modèles locaux GGUF", "attendus": ["wiki/concepts/GGUF.md", "wiki/concepts/Quantification.md"], "perimes": []}
+{"id": 28, "famille": "semantique", "q": "déploiement NetBird multi-VPS en haute disponibilité", "attendus": ["wiki/sources/2026-08-22-netbird-multi-vps-deploiement-ha-c885406e.md"], "perimes": []}
+{"id": 29, "famille": "semantique", "q": "clôture production ConvIA avec spool non bloquant", "attendus": ["wiki/sources/cloture-production-convia-spool-non-bloquant-mcp-chatgpt.md"], "perimes": []}
+{"id": 30, "famille": "semantique", "q": "double authentification SSH avec PAM", "attendus": ["wiki/sources/parametrage-a2f-ssh-pam.md", "wiki/sources/ssh-2fa-unattended-upgrades-et-fim.md"], "perimes": []}
+{"id": 31, "famille": "semantique", "q": "préférences de Titou pour planifier ses journées", "attendus": ["notes/Preferences_Planification_Titou.md"], "perimes": []}
+{"id": 32, "famille": "semantique", "q": "capture réseau Hermes Agent et synthèse de skills API", "attendus": ["Architecture/Hermes Agent - Capture"], "perimes": []}
+{"id": 33, "famille": "semantique", "q": "menaces et modèle d'attaque du coffre de secrets", "attendus": ["notes/Coffre de secrets VPS etude - threat model.md"], "perimes": []}
+{"id": 34, "famille": "historique", "q": "revue de réconciliation du planning du 9 septembre", "attendus": ["notes/planning/reconciliation/2026-09-09-review.md"], "perimes": []}
+{"id": 35, "famille": "historique", "q": "conversation sur le déploiement global de Semgrep en pre-commit", "attendus": ["raw/assets/ConvIA/Freebuff-Desktop/2026-08-30_deploiement", "raw/assets/ConvIA-Analysis/Freebuff-Desktop/2026-08-30_deploiement", "notes/infra/Erratum-semgrep-pre-commit-vps-etude.md"], "perimes": []}
+{"id": 36, "famille": "historique", "q": "audit du VPS et de NetBird fait le 28 août", "attendus": ["raw/assets/ConvIA-Analysis/Claude-CLI/2026-08-28_audit-vps-netbird", "raw/assets/ConvIA/Claude-CLI/2026-08-28_audit-vps-netbird"], "perimes": []}
+{"id": 37, "famille": "historique", "q": "erreur d'accès DNS NetBird du 10 septembre", "attendus": ["raw/assets/ConvIA-Analysis/Claude-CLI/2026-09-10_netbird-dns", "raw/assets/ConvIA/Claude-CLI/2026-09-10_netbird-dns"], "perimes": []}
+{"id": 38, "famille": "historique", "q": "réplication ARION du candidat gelé", "attendus": ["raw/assets/ConvIA-Analysis/Claude-Desktop/2026-09-09_replication-arion", "raw/assets/ConvIA/Claude-Desktop/2026-09-09_replication-arion"], "perimes": []}
+{"id": 39, "famille": "historique", "q": "refonte de ConvIA et orchestration LLM", "attendus": ["raw/assets/ConvIA-Analysis/Claude-Desktop/2026-09-06_convia-refonte", "raw/assets/ConvIA/Claude-Desktop/2026-09-06_convia-refonte"], "perimes": []}
+{"id": 40, "famille": "historique", "q": "activité ActivityWatch du 13 septembre", "attendus": ["notes/activity/aw/2026-09-13.md", "notes/activity/daily/2026-09-13"], "perimes": []}
