@@ -10,7 +10,8 @@
 //! * `VAULT_MCP_RS_UPSTREAM` (defaut `http://127.0.0.1:8787`, loopback requis),
 //! * `VAULT_MCP_RS_PORT` (defaut `18987` canary ; `8787` a la bascule),
 //! * `VAULT_MCP_RS_TOKEN` (>= 32 car.) OU `VAULT_MCP_RS_TOKEN_FILE`
-//!   (defaut `/opt/vault-mcp-rs/.mcp_token`) — fail-closed,
+//!   (defaut `/opt/vault-mcp/mcp.env` prod partage en lecture seule, SANS
+//!   copie — nu ou format env `VAULT_MCP_TOKEN=...`) — fail-closed,
 //! * `VAULT_MCP_RS_TOKEN_SCOPES` (defaut lecture+ecriture, quoté dans l'unit),
 //! * `VAULT_MCP_RS_CONSENT_HASH` (empreinte PBKDF2, vide = consentement refuse).
 
@@ -19,7 +20,9 @@ use vault_mcp_rs::{
     ISSUER_DEFAULT, PRM_ALIAS, READ_SCOPE, RESOURCE_NAME, RESOURCE_URL, WRITE_SCOPE,
 };
 
-/// Charge le Bearer statique DEDIE : variable directe, sinon fichier. Fail-closed.
+/// Charge le Bearer statique : variable directe, sinon fichier. Le fichier est
+/// soit nu (jeton seul), soit au format `KEY=valeur` (`mcp.env` prod partage,
+/// sans copie : variable `VAULT_MCP_TOKEN`). Echecs = messages statiques.
 fn load_static_token() -> Result<String, String> {
     if let Ok(v) = std::env::var("VAULT_MCP_RS_TOKEN") {
         let v = v.trim().to_string();
@@ -33,14 +36,10 @@ fn load_static_token() -> Result<String, String> {
     let path = std::env::var("VAULT_MCP_RS_TOKEN_FILE")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| "/opt/vault-mcp-rs/.mcp_token".to_string());
+        .unwrap_or_else(|| "/opt/vault-mcp/mcp.env".to_string());
     let raw = std::fs::read_to_string(&path)
-        .map_err(|e| format!("token Bearer illisible ({path}) : {e}"))?;
-    let tok = raw.trim().to_string();
-    if tok.len() < 32 {
-        return Err("token Bearer trop court (<32 car.), refuse de demarrer".to_string());
-    }
-    Ok(tok)
+        .map_err(|_| "token Bearer illisible (fichier)".to_string())?;
+    vault_mcp_rs::parse_token_file(&raw).map_err(str::to_string)
 }
 
 #[tokio::main]

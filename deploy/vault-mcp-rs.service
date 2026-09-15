@@ -12,7 +12,7 @@ WorkingDirectory=/opt/vault-mcp-rs
 Environment=VAULT_MCP_RS_ISSUER=https://impeach-ransack-broadside.ngrok-free.dev/
 Environment=VAULT_MCP_RS_UPSTREAM=http://127.0.0.1:8787
 Environment=VAULT_MCP_RS_PORT=18987
-Environment=VAULT_MCP_RS_TOKEN_FILE=/opt/vault-mcp-rs/.mcp_token
+Environment=VAULT_MCP_RS_TOKEN_FILE=/opt/vault-mcp/mcp.env
 Environment="VAULT_MCP_RS_TOKEN_SCOPES=mcp:lecture mcp:ecriture"
 ExecStart=/opt/vault-mcp-rs/vault-mcp-rs
 Restart=always

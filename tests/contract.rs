@@ -30,6 +30,19 @@ fn trente_huit_outils_connus() {
 }
 
 #[test]
+fn parse_token_nu_et_env() {
+    use vault_mcp_rs::parse_token_file;
+    assert_eq!(parse_token_file(&"y".repeat(40)).unwrap(), "y".repeat(40));
+    let env = "# commentaire\nAUTRE=1\nVAULT_MCP_TOKEN=zyxwvu-tsrqponm-lkjihgfe-dcba9876543210\n";
+    assert_eq!(
+        parse_token_file(env).unwrap(),
+        "zyxwvu-tsrqponm-lkjihgfe-dcba9876543210"
+    );
+    assert!(parse_token_file("trop-court").is_err());
+    assert!(parse_token_file("AUTRE=1\n").is_err());
+}
+
+#[test]
 fn inconnu_refuse_fail_closed() {
     let p = policy();
     assert_eq!(p.classify("drop_database"), ToolClass::Unknown);

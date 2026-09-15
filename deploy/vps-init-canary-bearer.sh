@@ -1,15 +1,15 @@
 #!/bin/bash
-# Genere le Bearer canary DEDIE (VPS uniquement, valeur jamais affichee ni
-# rapatriee). Idempotent : ne regenere jamais un fichier existant non vide.
+# Pre-requis canary vault : le Bearer edge est le `mcp.env` prod PARTAGE en
+# lecture seule (SANS copie — la facade retransmet le Bearer client a
+# l'upstream, meme emetteur, meme magasin). Ce script verifie la lisibilite
+# (longueur du fichier uniquement, jamais de valeur) et supprime tout fichier
+# canary orphelin.
 set -euo pipefail
-F=/opt/vault-mcp-rs/.mcp_token
-sudo install -d -o juliann-app -g juliann-app -m 0755 /opt/vault-mcp-rs
-if [ -s "$F" ]; then
-  echo "[bearer] deja present (longueur seule) :"
-  sudo wc -c "$F"
-  exit 0
+sudo -u juliann-app test -r /opt/vault-mcp/mcp.env
+echo "[bearer] mcp.env prod lisible par juliann-app (partage sans copie)"
+ORPHELIN=/opt/vault-mcp-rs/.mcp_token
+if [ -e "$ORPHELIN" ]; then
+  sudo rm -f "$ORPHELIN"
+  echo "[bearer] fichier canary orphelin supprime"
 fi
-sudo -u juliann-app python3 -c 'import secrets; open("/opt/vault-mcp-rs/.mcp_token", "w").write(secrets.token_urlsafe(48))'
-sudo chmod 600 "$F"
-echo "[bearer] genere (longueur seule) :"
-sudo wc -c "$F"
+sudo wc -c /opt/vault-mcp/mcp.env

@@ -112,6 +112,40 @@ pub fn policy() -> TablePolicy {
     TablePolicy::new(READ_SCOPE, WRITE_SCOPE, &entries)
 }
 
+/// Parse un fichier secret Bearer : nu (jeton seul) ou format env
+/// (`mcp.env` prod partage, assignation `VAULT_MCP_TOKEN`). Echecs = messages
+/// statiques (jamais de valeur, jamais de chemin).
+pub fn parse_token_file(raw: &str) -> Result<String, &'static str> {
+    let est_env = raw.lines().any(|l| {
+        let t = l.trim().strip_prefix("export ").unwrap_or(l.trim()).trim();
+        t.starts_with("VAULT_MCP_TOKEN=")
+    });
+    if est_env {
+        for ligne in raw.lines() {
+            let l = ligne.trim();
+            if l.is_empty() || l.starts_with('#') {
+                continue;
+            }
+            let l = l.strip_prefix("export ").unwrap_or(l);
+            if let Some((k, v)) = l.split_once('=') {
+                if k.trim() == "VAULT_MCP_TOKEN" {
+                    let tok = v.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+                    if tok.len() < 32 || tok.contains('\n') {
+                        return Err("token Bearer invalide (fichier)");
+                    }
+                    return Ok(tok);
+                }
+            }
+        }
+        return Err("token Bearer introuvable (fichier)");
+    }
+    let tok = raw.trim().to_string();
+    if tok.len() < 32 {
+        return Err("token Bearer trop court (<32 car.), refuse de demarrer");
+    }
+    Ok(tok)
+}
+
 /// Configuration d'assemblage (resolue par le binaire).
 pub struct ServiceConfig {
     pub upstream: String,

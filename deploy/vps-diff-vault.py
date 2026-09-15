@@ -1,7 +1,9 @@
 """Diff contrat zero live : prod Python :8787 vs canary Rust :18987.
 
-Secrets lus depuis leurs fichiers 600 sur le VPS uniquement (jamais affiches,
-jamais journalises). Echec de parsing = message statique, exit 2.
+Le Bearer edge est le `mcp.env` prod PARTAGE (sans copie) : le meme jeton
+vaut des deux cotes (la facade retransmet a l'upstream, meme magasin).
+Secret lu sur le VPS uniquement (jamais affiche, jamais journalise).
+Echec de parsing = message statique, exit 2.
 Compare : initialize, tools/list (38 noms + descriptions + inputSchema),
 resources/list + prompts/list (parite), tools/call reel read-only
 `vault_status`, refus local outil inconnu (-32000 canary ; prod = erreur SDK).
@@ -13,7 +15,6 @@ import sys
 import urllib.request
 
 PROD_FILE = sys.argv[1] if len(sys.argv) > 1 else "/opt/vault-mcp/mcp.env"
-CANARY_FILE = sys.argv[2] if len(sys.argv) > 2 else "/opt/vault-mcp-rs/.mcp_token"
 PROD = "http://127.0.0.1:8787"
 CANARY = "http://127.0.0.1:18987"
 
@@ -43,20 +44,11 @@ def lire_prod_env(path):
 
 
 def lire_token(path):
-    try:
-        with open(path, encoding="utf-8") as fh:
-            tok = fh.read().strip()
-    except OSError:
-        print("JETON_CANARY_ILLISIBLE")
-        sys.exit(2)
-    if len(tok) < 32:
-        print("JETON_CANARY_INVALIDE")
-        sys.exit(2)
-    return tok
+    return lire_prod_env(path)
 
 
 TOKEN_PROD = lire_prod_env(PROD_FILE)
-TOKEN_CANARY = lire_token(CANARY_FILE)
+TOKEN_CANARY = TOKEN_PROD
 
 
 def sse_unwrap(raw):
