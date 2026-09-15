@@ -16,8 +16,8 @@
 //! * `VAULT_MCP_RS_CONSENT_HASH` (empreinte PBKDF2, vide = consentement refuse).
 //! * `VAULT_MCP_RS_OAUTH_ETAT` (defaut `/opt/vault-mcp/oauth/etat.json` :
 //!   pont READ-ONLY vers le magasin Python, sessions existantes sans
-//!   re-consentement ; vide = pont desactive ; `resource` TOUJOURS exigee
-//!   egale a l'URL canonique, parite `AuthSettings`).
+//!   re-consentement ; vide = pont desactive ; aucun controle `resource`,
+//!   parite observee du Python).
 
 use mcp_auth::oauth::OAuthConfig;
 use vault_mcp_rs::{

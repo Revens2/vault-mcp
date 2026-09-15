@@ -186,10 +186,14 @@ fn build_router_full(
     let store = Arc::new(MemoryStore::default());
     let file = mount.filter(|m| !m.etat_path.trim().is_empty()).map(|m| {
         let fs = FileStore::new(&m.etat_path);
-        // Parité vault (`AuthSettings.resource_server_url`) : la ressource
-        // attendue est TOUJOURS l'URL canonique du service, jamais une
-        // valeur client — un `expected_resource` fourni est ignoré.
-        Arc::new(fs.with_expected_resource(RESOURCE_URL))
+        // Parité observée : le Python ne contrôle jamais `resource` en
+        // pratique (`AuthSettings.validate_token_resource` non posé →
+        // `resource_server_url=None` côté `BearerAuthBackend`). Un
+        // `expected_resource` explicite reste un opt-in strict.
+        match m.expected_resource {
+            Some(r) if !r.trim().is_empty() => Arc::new(fs.with_expected_resource(r)),
+            _ => Arc::new(fs),
+        }
     });
     if let Some(f) = &file {
         // Fail-closed par requête si illisible (le magasin naît à la première

@@ -217,14 +217,15 @@ async fn appel_outil_inconnu_refuse_avant_upstream() {
     assert_eq!(v["error"]["code"], -32000);
 }
 
-/// Pont fichier parité vault : `resource` égale exigée (comme
-/// `AuthSettings.resource_server_url`) ; session existante acceptée.
+/// Pont fichier parité observée : le Python n'exige jamais `resource`
+/// (`validate_token_resource` non posé) — session existante acceptée,
+/// resource absente ou incohérente acceptée comme en prod.
 #[tokio::test]
-async fn pont_fichier_exige_resource_canonique() {
+async fn pont_fichier_parite_observee_sans_controle_resource() {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
-    use vault_mcp_rs::{build_router_with_filestore, ServiceConfig, RESOURCE_URL};
+    use vault_mcp_rs::{build_router_with_filestore, ServiceConfig};
 
     let dir = std::env::temp_dir().join(format!(
         "vault-pont-{}",
@@ -235,17 +236,17 @@ async fn pont_fichier_exige_resource_canonique() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let etat = dir.join("etat.json");
-    let tok_ok = "synthetique-vault-pont-ok-0000000001";
-    let tok_bad = "synthetique-vault-pont-ko-000000001";
+    let tok_none = "synthetique-vault-pont-none-00000001";
+    let tok_autre = "synthetique-vault-pont-autre-0000001";
     let doc = serde_json::json!({
         "demandes": {}, "codes": {},
         "acces": {
-            tok_ok: {
-                "jeton": tok_ok, "client_id": "client-synth",
-                "scopes": ["mcp:lecture"], "resource": RESOURCE_URL,
+            tok_none: {
+                "jeton": tok_none, "client_id": "client-synth",
+                "scopes": ["mcp:lecture"], "resource": serde_json::Value::Null,
                 "expire_a": 9_999_999_999i64 },
-            tok_bad: {
-                "jeton": tok_bad, "client_id": "client-synth",
+            tok_autre: {
+                "jeton": tok_autre, "client_id": "client-synth",
                 "scopes": ["mcp:lecture"], "resource": "https://autre.example/mcp",
                 "expire_a": 9_999_999_999i64 } },
         "rafraichissements": {},
@@ -262,32 +263,34 @@ async fn pont_fichier_exige_resource_canonique() {
             },
             Some(mcp_gateway::router::FileStoreMount {
                 etat_path: etat.to_string_lossy().to_string(),
-                expected_resource: None, // le pont vault impose le canonique
+                expected_resource: None,
             }),
         )
         .expect("gateway de test")
     };
     let body = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"outil-x"}}"#;
-    // `resource` canonique : auth OK → refus local -32000 (pas 401).
+    // `resource` nulle puis incohérente : auth OK → refus local -32000 (pas 401).
+    for tok in [tok_none, tok_autre] {
+        let res = app_of()
+            .oneshot(
+                Request::post("/mcp")
+                    .header("authorization", format!("Bearer {tok}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{tok}");
+        let bytes = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["code"], -32000, "{tok}");
+    }
+    // Opaque inconnu : toujours 401.
     let res = app_of()
         .oneshot(
             Request::post("/mcp")
-                .header("authorization", format!("Bearer {tok_ok}"))
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
-    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v["error"]["code"], -32000);
-    // `resource` incohérente : 401 (parité Python).
-    let res = app_of()
-        .oneshot(
-            Request::post("/mcp")
-                .header("authorization", format!("Bearer {tok_bad}"))
+                .header("authorization", "Bearer inconnu-synth-0123456789abcdef")
                 .header("content-type", "application/json")
                 .body(Body::from(body))
                 .unwrap(),
