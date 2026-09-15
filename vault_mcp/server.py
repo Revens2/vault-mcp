@@ -46,7 +46,7 @@ from vault_mcp.safety import (
     valider_dossier,
     valider_ecriture,
 )
-from vault_mcp import __version__, convia_mcp, convia_queue, dirty
+from vault_mcp import __version__, convia_mcp, convia_queue, dirty, frais
 from vault_mcp.secrets import masquer
 from vault_mcp.spool import Spool, SpoolError
 from vault_mcp.store import StoreError
@@ -1057,6 +1057,8 @@ def vault_status() -> dict[str, object]:
     if _index.disponible:
         etat["index_fragments"] = len(_index.metas)
         etat["index_notes"] = len(_index.fragments_par_note)
+    # Notes trouvables par search_vault AVANT leur embedding (vault_mcp.frais).
+    etat.update(frais.statistiques())
     return etat
 
 

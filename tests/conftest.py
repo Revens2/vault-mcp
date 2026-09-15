@@ -25,7 +25,8 @@ def _isoler_des_chemins_de_production(
     monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
     racine = tmp_path_factory.mktemp("hors-production")
-    for variable, nom in (("VAULT_MCP_VAULT", "miroir"), ("VAULT_MCP_INDEX", "index")):
+    for variable, nom in (("VAULT_MCP_VAULT", "miroir"), ("VAULT_MCP_INDEX", "index"),
+                          ("VAULT_MCP_DIRTY", "dirty")):
         if variable not in os.environ:
             chemin = racine / nom
             chemin.mkdir()
@@ -35,6 +36,7 @@ def _isoler_des_chemins_de_production(
     # CI) : un test pouvait donc dependre de l etat reel de la file Wiki.
     for variable, nom in (("VAULT_MCP_TELEMETRY_DB", "telemetry.db"),
                           ("WIKI_JOBS_DB", "wiki_jobs.db"),
-                          ("CONVIA_QUEUE_DB", "convia.db")):
+                          ("CONVIA_QUEUE_DB", "convia.db"),
+                          ("VAULT_MCP_FRAIS", "frais.sqlite")):
         if variable not in os.environ:
             monkeypatch.setenv(variable, str(racine / nom))

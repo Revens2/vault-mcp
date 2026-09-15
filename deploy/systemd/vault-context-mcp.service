@@ -1,0 +1,48 @@
+[Unit]
+Description=Vault context MCP (lecture seule, 127.0.0.1) -- second serveur, jeton dedie
+After=network-online.target
+Wants=network-online.target
+OnFailure=notify-failure@%n.service
+
+[Service]
+User=juliann-app
+Group=juliann-app
+WorkingDirectory=/opt/vault-mcp
+# VAULT_CONTEXT_TOKEN, VAULT_CONTEXT_PORT. Jamais le jeton du serveur principal.
+EnvironmentFile=/opt/vault-mcp/context.env
+Environment=HOME=/opt/vault-mcp
+ExecStart=/opt/vault-mcp/venv/bin/python -m vault_mcp.contexte
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+IPAddressAllow=localhost
+IPAddressDeny=any
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+UMask=0077
+ReadOnlyPaths=/srv/vault-mirror /var/lib/vault-mcp
+# Seule ecriture : les fichiers de verrou flock partages de l'index (jamais l'index).
+ReadWritePaths=/opt/vault-mcp/index
+
+[Install]
+WantedBy=multi-user.target

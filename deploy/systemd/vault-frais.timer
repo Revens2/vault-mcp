@@ -1,0 +1,11 @@
+[Unit]
+Description=Rafraichissement de la voie fraiche du RAG (chaque minute apres la fin du precedent)
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=60s
+AccuracySec=10s
+Unit=vault-frais.service
+
+[Install]
+WantedBy=timers.target

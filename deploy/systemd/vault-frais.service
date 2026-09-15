@@ -1,0 +1,46 @@
+[Unit]
+Description=Voie fraiche du RAG : notes trouvables avant leur embedding (zero LLM)
+Documentation=file:///opt/vault-mcp/vault_mcp/frais.py
+After=local-fs.target
+OnFailure=notify-failure@%n.service
+
+[Service]
+Type=oneshot
+User=juliann-app
+Group=juliann-app
+WorkingDirectory=/opt/vault-mcp
+Environment=PYTHONPATH=/opt/vault-mcp
+Environment=HOME=/opt/vault-mcp
+ExecStart=/opt/vault-mcp/venv/bin/python /opt/vault-mcp/scripts/frais_worker.py
+TimeoutStartSec=15min
+StandardInput=null
+Nice=5
+CPUWeight=50
+IOSchedulingClass=best-effort
+PrivateNetwork=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+UMask=0077
+ReadWritePaths=/var/lib/vault-mcp
+ReadOnlyPaths=/srv/vault-mirror /srv/vault-spool/dirty

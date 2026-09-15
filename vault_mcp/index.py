@@ -589,7 +589,9 @@ class Index:
         mots = {m.lower() for m in _MOT.findall(requete)}
         if not mots:
             return []
-        resultats: list[Resultat] = []
+        # Voie fraiche en tete : une note pas encore indexee n'a pas d'autre chance.
+        indexees = self._courant().fragments_par_note
+        resultats: list[Resultat] = [r for r in _frais(requete, limit) if r.chemin not in indexees]
         for meta in self._courant().metas:
             corpus = f"{meta.titre} {meta.apercu} {meta.chemin}".lower()
             touches = sum(1 for mot in mots if mot in corpus)
@@ -613,8 +615,12 @@ class Index:
         docs/eval-retrieval.md. Retombe sur l'ancien lexical tant que le BM25 n'est pas pret.
         """
         instantane = self._courant()
+        pool = max(limit * 5, 20)
+        # Voie fraiche (vault_mcp.frais) : notes du miroir que l'index publie ne
+        # reflete pas encore -- ConvIA arrivees par rclone, lots en attente d'embedding.
+        frais = _frais(requete, pool)
         if not instantane.metas:
-            return []
+            return frais[:limit]
         bm25 = self._bm25_pret(instantane)
         if bm25 is None:
             return fusion_rang_reciproque(
@@ -622,7 +628,6 @@ class Index:
                 self.recherche_lexicale(requete, limit * 2),
                 limit,
             )
-        pool = max(limit * 5, 20)
         q = vectoriser_un(requete)
         scores = np.asarray(instantane.vecteurs, dtype=np.float32) @ q
         vecteur: list[tuple[float, str, int]] = []
@@ -647,21 +652,32 @@ class Index:
         for rang, (chemin, ligne) in enumerate(lexical):
             cumul[chemin] = cumul.get(chemin, 0.0) + 1.0 / (61 + rang)
             ligne_de.setdefault(chemin, ligne)
+        # La voie fraiche remplace a elle seule vecteur ET BM25 pour une note ABSENTE
+        # de l'index : son poids compense l'absence de seconde liste. Une note deja
+        # indexee garde son classement d'index (garde aussi cote worker, cf. frais.py) :
+        # le lui cumuler faisait regresser le banc -- mesure en prod 2026-09-14.
+        poids_frais = _poids_frais()
+        recents: dict[str, Resultat] = {}
+        for rang, resultat in enumerate(
+            r for r in frais if r.chemin not in instantane.fragments_par_note
+        ):
+            cumul[resultat.chemin] = cumul.get(resultat.chemin, 0.0) + poids_frais / (61 + rang)
+            recents.setdefault(resultat.chemin, resultat)
         poids = poids_autorite()
         if poids and not historique(requete):
             for chemin in cumul:
                 cumul[chemin] += poids * (4 - rang_autorite(chemin)) / 4 / 61
         ordonnes = sorted(cumul.items(), key=lambda kv: -kv[1])[:limit]
-        return [
-            Resultat(
-                chemin=chemin,
-                titre=instantane.metas[ligne_de[chemin]].titre,
-                apercu=instantane.metas[ligne_de[chemin]].apercu,
-                score=score,
-                origine="hybride",
-            )
-            for chemin, score in ordonnes
-        ]
+        sortie: list[Resultat] = []
+        for chemin, score in ordonnes:
+            if chemin in recents:
+                # Le contenu frais est plus recent que l'apercu indexe.
+                r = recents[chemin]
+                sortie.append(Resultat(chemin, r.titre, r.apercu, score, "frais"))
+            else:
+                meta = instantane.metas[ligne_de[chemin]]
+                sortie.append(Resultat(chemin, meta.titre, meta.apercu, score, "hybride"))
+        return sortie
 
     # ----------------------------------------------------------- BM25 plein texte
 
@@ -925,6 +941,20 @@ def fusion_rang_reciproque(
         )
         for chemin, score in ordonnes[:limit]
     ]
+
+
+def _poids_frais() -> float:
+    return float(os.environ.get("VAULT_MCP_POIDS_FRAIS", "2.0"))
+
+
+def _frais(requete: str, limit: int) -> list[Resultat]:
+    """Classement de la voie fraiche, vide si desactivee ou absente."""
+    if not _poids_frais():
+        return []
+    # Import tardif : `frais` importe `Resultat` depuis ce module.
+    from vault_mcp import frais
+
+    return frais.rechercher(requete, limit)
 
 
 def _dedupliquer(resultats: list[Resultat], limit: int) -> list[Resultat]:

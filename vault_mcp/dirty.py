@@ -130,6 +130,20 @@ def taille() -> int:
     return sum(1 for f in file_attente.glob("*.path"))
 
 
+def en_attente() -> set[str]:
+    """Chemins sales pas encore publies : file, lots en vol et differes. Lecture seule."""
+    file_attente, vol, differe = repertoires()
+    chemins: set[str] = set()
+    for entree in (*file_attente.glob("*.path"), *vol.glob("*/*.path"), *differe.glob("*.path")):
+        try:
+            chemin = entree.read_text(encoding="utf-8").strip()
+        except OSError:
+            continue
+        if chemin:
+            chemins.add(chemin)
+    return chemins
+
+
 def recuperer() -> int:
     """Remet dans la file les lots `inflight` orphelins (crash du worker)."""
     file_attente, vol, _ = repertoires()
