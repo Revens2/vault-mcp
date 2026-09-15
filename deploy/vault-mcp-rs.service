@@ -14,6 +14,10 @@ Environment=VAULT_MCP_RS_UPSTREAM=http://127.0.0.1:8787
 Environment=VAULT_MCP_RS_PORT=18987
 Environment=VAULT_MCP_RS_TOKEN_FILE=/opt/vault-mcp/mcp.env
 Environment="VAULT_MCP_RS_TOKEN_SCOPES=mcp:lecture mcp:ecriture"
+# Pont fichier OAuth (transition, read-only) : sessions Python existantes
+# acceptees sans re-consentement (`resource` exigee, parite vault).
+# Meme User que le Python (0600).
+Environment=VAULT_MCP_RS_OAUTH_ETAT=/opt/vault-mcp/oauth/etat.json
 ExecStart=/opt/vault-mcp-rs/vault-mcp-rs
 Restart=always
 RestartSec=3

@@ -216,3 +216,84 @@ async fn appel_outil_inconnu_refuse_avant_upstream() {
     assert_eq!(v["id"], 7);
     assert_eq!(v["error"]["code"], -32000);
 }
+
+/// Pont fichier parité vault : `resource` égale exigée (comme
+/// `AuthSettings.resource_server_url`) ; session existante acceptée.
+#[tokio::test]
+async fn pont_fichier_exige_resource_canonique() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use vault_mcp_rs::{build_router_with_filestore, ServiceConfig, RESOURCE_URL};
+
+    let dir = std::env::temp_dir().join(format!(
+        "vault-pont-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let etat = dir.join("etat.json");
+    let tok_ok = "synthetique-vault-pont-ok-0000000001";
+    let tok_bad = "synthetique-vault-pont-ko-000000001";
+    let doc = serde_json::json!({
+        "demandes": {}, "codes": {},
+        "acces": {
+            tok_ok: {
+                "jeton": tok_ok, "client_id": "client-synth",
+                "scopes": ["mcp:lecture"], "resource": RESOURCE_URL,
+                "expire_a": 9_999_999_999i64 },
+            tok_bad: {
+                "jeton": tok_bad, "client_id": "client-synth",
+                "scopes": ["mcp:lecture"], "resource": "https://autre.example/mcp",
+                "expire_a": 9_999_999_999i64 } },
+        "rafraichissements": {},
+    });
+    std::fs::write(&etat, doc.to_string()).unwrap();
+    let app_of = || {
+        build_router_with_filestore(
+            ServiceConfig {
+                upstream: "http://127.0.0.1:9".to_string(),
+                static_token: "x".repeat(32),
+                static_token_scopes: vec![READ_SCOPE.to_string()],
+                oauth: oauth_cfg(),
+                max_body_bytes: 1024 * 1024,
+            },
+            Some(mcp_gateway::router::FileStoreMount {
+                etat_path: etat.to_string_lossy().to_string(),
+                expected_resource: None, // le pont vault impose le canonique
+            }),
+        )
+        .expect("gateway de test")
+    };
+    let body = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"outil-x"}}"#;
+    // `resource` canonique : auth OK → refus local -32000 (pas 401).
+    let res = app_of()
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", format!("Bearer {tok_ok}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["error"]["code"], -32000);
+    // `resource` incohérente : 401 (parité Python).
+    let res = app_of()
+        .oneshot(
+            Request::post("/mcp")
+                .header("authorization", format!("Bearer {tok_bad}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    let _ = std::fs::remove_dir_all(&dir);
+}

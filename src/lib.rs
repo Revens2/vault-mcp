@@ -41,6 +41,7 @@ use axum::response::{IntoResponse, Response};
 use axum::{middleware, routing::get, Router};
 
 use mcp_auth::bearer::{bearer_middleware, json_response, BearerState, StaticBearer, TokenScopes};
+use mcp_auth::filestore::{ChainedResolver, FileStore};
 use mcp_auth::oauth::{
     auth_router, protected_resource_router, MemoryStore, OAuthConfig, OAuthState,
 };
@@ -163,11 +164,37 @@ struct AppState {
 }
 
 /// Assemble le routeur complet : sante + OAuth + PRM/AS transcrits + `/mcp` + 404.
+/// Sans pont fichier (comportement v0.2).
 pub fn build_router(cfg: ServiceConfig) -> Result<Router, mcp_core::error::Error> {
+    build_router_full(cfg, None)
+}
+
+/// Assemble le routeur avec pont fichier optionnel (sessions OAuth Python
+/// existantes acceptées sans re-consentement, `resource` exigée parité
+/// vault ; `None` = comme [`build_router`]).
+pub fn build_router_with_filestore(
+    cfg: ServiceConfig,
+    mount: Option<mcp_gateway::router::FileStoreMount>,
+) -> Result<Router, mcp_core::error::Error> {
+    build_router_full(cfg, mount)
+}
+
+fn build_router_full(
+    cfg: ServiceConfig,
+    mount: Option<mcp_gateway::router::FileStoreMount>,
+) -> Result<Router, mcp_core::error::Error> {
     let store = Arc::new(MemoryStore::default());
+    let file = mount.filter(|m| !m.etat_path.trim().is_empty()).map(|m| {
+        let fs = FileStore::new(&m.etat_path);
+        // Parité vault (`AuthSettings.resource_server_url`) : la ressource
+        // attendue est TOUJOURS l'URL canonique du service, jamais une
+        // valeur client — un `expected_resource` fourni est ignoré.
+        Arc::new(fs.with_expected_resource(RESOURCE_URL))
+    });
+    let chained = Arc::new(ChainedResolver::new(Arc::clone(&store), file));
     let oauth_state = OAuthState {
         config: Arc::new(cfg.oauth.clone()),
-        store: Arc::clone(&store),
+        store,
     };
     let bearer_state = BearerState::new(
         StaticBearer::new(
@@ -175,7 +202,7 @@ pub fn build_router(cfg: ServiceConfig) -> Result<Router, mcp_core::error::Error
             "vault-mcp-cli-statique",
             &cfg.static_token_scopes,
         ),
-        store,
+        chained,
         vec![READ_SCOPE.to_string()],
         PRM_URL.to_string(),
     );
@@ -197,7 +224,7 @@ pub fn build_router(cfg: ServiceConfig) -> Result<Router, mcp_core::error::Error
                 .delete(mcp_handler)
                 .route_layer(middleware::from_fn_with_state(
                     bearer_state,
-                    bearer_middleware::<MemoryStore>,
+                    bearer_middleware::<ChainedResolver>,
                 )),
         )
         .with_state(app_state);

@@ -14,6 +14,10 @@
 //!   copie — nu ou format env `VAULT_MCP_TOKEN=...`) — fail-closed,
 //! * `VAULT_MCP_RS_TOKEN_SCOPES` (defaut lecture+ecriture, quoté dans l'unit),
 //! * `VAULT_MCP_RS_CONSENT_HASH` (empreinte PBKDF2, vide = consentement refuse).
+//! * `VAULT_MCP_RS_OAUTH_ETAT` (defaut `/opt/vault-mcp/oauth/etat.json` :
+//!   pont READ-ONLY vers le magasin Python, sessions existantes sans
+//!   re-consentement ; vide = pont desactive ; `resource` TOUJOURS exigee
+//!   egale a l'URL canonique, parite `AuthSettings`).
 
 use mcp_auth::oauth::OAuthConfig;
 use vault_mcp_rs::{
@@ -80,6 +84,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::io::Error::new(std::io::ErrorKind::PermissionDenied, e)
     })?;
     unsafe { std::env::set_var("VAULT_MCP_RS_TOKEN", &token) };
+    // Pont fichier OAuth (transition) : Python = AS/control-plane, Rust =
+    // data-plane. Meme utilisateur UNIX que le Python (fichiers 0600).
+    if std::env::var("VAULT_MCP_RS_OAUTH_ETAT")
+        .unwrap_or_default()
+        .trim()
+        .is_empty()
+    {
+        unsafe { std::env::set_var("VAULT_MCP_RS_OAUTH_ETAT", "/opt/vault-mcp/oauth/etat.json") };
+    }
 
     let env = mcp_gateway::config::from_prefix(
         "VAULT_MCP_RS",
@@ -90,22 +103,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let port = env.port;
     let upstream_log = env.upstream.clone();
-    let app = vault_mcp_rs::build_router(vault_mcp_rs::ServiceConfig {
-        upstream: env.upstream,
-        static_token: env.static_token,
-        static_token_scopes: env.token_scopes,
-        oauth: OAuthConfig {
-            issuer: env.issuer,
-            resource_url: RESOURCE_URL.to_string(),
-            resource_name: RESOURCE_NAME.to_string(),
-            default_scope: READ_SCOPE.to_string(),
-            valid_scopes: vec![READ_SCOPE.to_string(), WRITE_SCOPE.to_string()],
-            extra_submit_scopes: vec![WRITE_SCOPE.to_string()],
-            consent_hash: env.consent_hash,
-            static_client_id: "vault-mcp-cli-statique".to_string(),
+    let mount = mcp_gateway::config::filestore_mount(&env);
+    let app = vault_mcp_rs::build_router_with_filestore(
+        vault_mcp_rs::ServiceConfig {
+            upstream: env.upstream,
+            static_token: env.static_token,
+            static_token_scopes: env.token_scopes,
+            oauth: OAuthConfig {
+                issuer: env.issuer,
+                resource_url: RESOURCE_URL.to_string(),
+                resource_name: RESOURCE_NAME.to_string(),
+                default_scope: READ_SCOPE.to_string(),
+                valid_scopes: vec![READ_SCOPE.to_string(), WRITE_SCOPE.to_string()],
+                extra_submit_scopes: vec![WRITE_SCOPE.to_string()],
+                consent_hash: env.consent_hash,
+                static_client_id: "vault-mcp-cli-statique".to_string(),
+            },
+            max_body_bytes: mcp_http::hardening::DEFAULT_MAX_BODY_BYTES,
         },
-        max_body_bytes: mcp_http::hardening::DEFAULT_MAX_BODY_BYTES,
-    })?;
+        mount,
+    )?;
     let _ = PRM_ALIAS;
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
     tracing::info!(
