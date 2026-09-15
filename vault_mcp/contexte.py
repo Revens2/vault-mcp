@@ -35,7 +35,8 @@ from vault_mcp.store import StoreError
 
 CHEMIN_PUBLIC = "/mcp"
 OUTILS_LECTURE = frozenset(
-    {"list_notes", "read_note", "search_notes", "search_vault", "get_graph_context", "context_status"}
+    {"list_notes", "read_note", "search_notes", "search_vault",
+     "get_graph_context", "context_status"}
 )
 
 
