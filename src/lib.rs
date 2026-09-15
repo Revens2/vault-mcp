@@ -191,6 +191,15 @@ fn build_router_full(
         // valeur client — un `expected_resource` fourni est ignoré.
         Arc::new(fs.with_expected_resource(RESOURCE_URL))
     });
+    if let Some(f) = &file {
+        // Fail-closed par requête si illisible (le magasin naît à la première
+        // émission Python) ; le Bearer statique reste disponible.
+        if std::fs::metadata(f.etat_path()).is_ok() {
+            tracing::info!("pont fichier OAuth (read-only) monte");
+        } else {
+            tracing::warn!("pont fichier OAuth illisible au boot (fail-closed par requete)");
+        }
+    }
     let chained = Arc::new(ChainedResolver::new(Arc::clone(&store), file));
     let oauth_state = OAuthState {
         config: Arc::new(cfg.oauth.clone()),
