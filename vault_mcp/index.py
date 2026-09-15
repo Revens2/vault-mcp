@@ -944,7 +944,9 @@ def fusion_rang_reciproque(
 
 
 def _poids_frais() -> float:
-    return float(os.environ.get("VAULT_MCP_POIDS_FRAIS", "2.0"))
+    # 1.0 et non 2.0 : a 2.0 les revues/analyses non indexees evincaient la note
+    # canonique du top 1 (sonde servie 2026-09-15 : MRR 0,62 a 2.0, 0,72 a 1.0).
+    return float(os.environ.get("VAULT_MCP_POIDS_FRAIS", "1.0"))
 
 
 def _frais(requete: str, limit: int) -> list[Resultat]:

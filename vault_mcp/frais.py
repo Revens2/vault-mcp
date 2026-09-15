@@ -57,7 +57,7 @@ def base() -> Path:
 
 
 def poids() -> float:
-    return float(os.environ.get("VAULT_MCP_POIDS_FRAIS", "2.0"))
+    return float(os.environ.get("VAULT_MCP_POIDS_FRAIS", "1.0"))
 
 
 def chemins_indexes() -> set[str]:
