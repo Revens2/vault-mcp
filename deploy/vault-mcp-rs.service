@@ -1,0 +1,43 @@
+[Unit]
+Description=Vault MCP adaptateur Rust (canary, loopback 18987)
+After=network-online.target vault-mcp.service
+Wants=network-online.target
+
+[Service]
+# Canary : ne touche JAMAIS au service prod vault-mcp.service.
+# Bascule atomique GATEE (OAuth JWT meme famille + rotation = exploitant).
+User=juliann-app
+Group=juliann-app
+WorkingDirectory=/opt/vault-mcp-rs
+Environment=VAULT_MCP_RS_ISSUER=https://impeach-ransack-broadside.ngrok-free.dev/
+Environment=VAULT_MCP_RS_UPSTREAM=http://127.0.0.1:8787
+Environment=VAULT_MCP_RS_PORT=18987
+Environment=VAULT_MCP_RS_TOKEN_FILE=/opt/vault-mcp-rs/.mcp_token
+Environment="VAULT_MCP_RS_TOKEN_SCOPES=mcp:lecture mcp:ecriture"
+ExecStart=/opt/vault-mcp-rs/vault-mcp-rs
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ReadWritePaths=/opt/vault-mcp-rs
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
