@@ -26,9 +26,17 @@
 //!   fonctionnellement paritaires ;
 //! * rewrite `mcp-protocol-version` 2026-07-28 -> 2025-11-25 ;
 //! * ajouts `/health` + `/ready` (le Python repond 404).
+//! * pont stateless (voir [`stateless`]) : les requetes AVEC `id`, SANS
+//!   `mcp-session-id`, autres que `initialize` (clients sans session, ex.
+//!   connecteur ChatGPT), sont servies via une session upstream poolée par
+//!   credential, reponse SANS `mcp-session-id` (stateless vu du client,
+//!   comme github/orch qui n'en renvoient pas). Tout le reste (session
+//!   presente, `initialize`, notifications) : relais direct inchange.
 //!
 //! OAuth JWT/Python vs opaque/Rust : canary via Bearer statique dedie
 //! (meme famille que les lots precedents, bascule gated).
+
+pub mod stateless;
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -161,6 +169,7 @@ struct AppState {
     client: reqwest::Client,
     upstream: String,
     policy: Arc<TablePolicy>,
+    bridge: Arc<stateless::StatelessBridge>,
 }
 
 /// Assemble le routeur complet : sante + OAuth + PRM/AS transcrits + `/mcp` + 404.
@@ -227,6 +236,7 @@ fn build_router_full(
         client,
         upstream: cfg.upstream.trim_end_matches('/').to_string(),
         policy: Arc::new(policy()),
+        bridge: Arc::new(stateless::StatelessBridge::new()),
     };
 
     let mcp_route = Router::new()
@@ -336,6 +346,26 @@ async fn mcp_handler(State(state): State<AppState>, req: Request) -> Response {
         }
     }
 
+    // Pont stateless (compat clients sans session, ex. ChatGPT) : POST avec
+    // `id`, sans `mcp-session-id`, autre que `initialize`. Tout le reste
+    // (session presente, `initialize`, notifications, GET/DELETE) : direct.
+    let pontable = method == Method::POST
+        && !parts.headers.contains_key("mcp-session-id")
+        && body_bytes
+            .as_deref()
+            .is_some_and(|b| stateless::classify_body(b) == stateless::BridgeKind::Request);
+    if pontable {
+        return bridge_forward(
+            &state,
+            &path,
+            query.as_deref(),
+            &parts.headers,
+            body_bytes,
+            authorization,
+        )
+        .await;
+    }
+
     forward(
         &state,
         &method,
@@ -346,6 +376,147 @@ async fn mcp_handler(State(state): State<AppState>, req: Request) -> Response {
         authorization,
     )
     .await
+}
+
+/// Pont stateless → stateful : sert une requete sans session via une session
+/// upstream poolée par credential (meme `Authorization` client, jamais stocke :
+/// seule son empreinte indexe le cache). Reponse SANS `mcp-session-id`.
+/// Tout echec d'etablissement = repli vers le relais direct (400 parite),
+/// jamais d'erreur inventee ni de contournement d'authentification.
+async fn bridge_forward(
+    state: &AppState,
+    path: &str,
+    query: Option<&str>,
+    headers: &axum::http::HeaderMap,
+    body: Option<Vec<u8>>,
+    authorization: Option<String>,
+) -> Response {
+    let Some(auth) = authorization else {
+        return forward_direct(state, path, query, headers, body, None).await;
+    };
+    let key = stateless::credential_key(&auth);
+    let accept = headers
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let version = headers
+        .get("mcp-protocol-version")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
+    // 1) Session poolée encore valide : rejouer direct, re-etablir sur 404.
+    if let Some(sess) = state.bridge.get(&key).await {
+        if let Some(resp) = forward_as(
+            state,
+            path,
+            query,
+            headers,
+            body.clone(),
+            auth.clone(),
+            &sess,
+        )
+        .await
+        {
+            if resp.status() != StatusCode::NOT_FOUND {
+                return strip_session(resp);
+            }
+            state.bridge.evict(&key).await;
+        } else {
+            state.bridge.evict(&key).await;
+        }
+    }
+
+    // 2) Etablir une session upstream avec le credential en cours, puis rejouer.
+    // Un seul essai : echec = repli direct (400 parite, fail-closed).
+    if let Some(sess) = stateless::establish_session(
+        &state.client,
+        &state.upstream,
+        &auth,
+        accept.as_deref(),
+        version.as_deref(),
+    )
+    .await
+    {
+        state.bridge.put(key.clone(), sess.clone()).await;
+        if let Some(resp) = forward_as(
+            state,
+            path,
+            query,
+            headers,
+            body.clone(),
+            auth.clone(),
+            &sess,
+        )
+        .await
+        {
+            if resp.status() == StatusCode::NOT_FOUND {
+                state.bridge.evict(&key).await;
+            }
+            return strip_session(resp);
+        }
+        state.bridge.evict(&key).await;
+    } else {
+        tracing::warn!("pont stateless : session amont indisponible (repli parite)");
+    }
+    forward_direct(state, path, query, headers, body, Some(auth)).await
+}
+
+/// Relais direct (sans pont) : factorise le repli fail-closed du pont.
+async fn forward_direct(
+    state: &AppState,
+    path: &str,
+    query: Option<&str>,
+    headers: &axum::http::HeaderMap,
+    body: Option<Vec<u8>>,
+    authorization: Option<String>,
+) -> Response {
+    forward(
+        state,
+        &Method::POST,
+        path,
+        query,
+        headers,
+        body,
+        authorization,
+    )
+    .await
+}
+
+/// Retire `mcp-session-id` d'une reponse pointee (stateless vu du client,
+/// comme github/orch qui n'en renvoient pas ; evite qu'un client ferme une
+/// session poolée partagee via DELETE).
+fn strip_session(mut resp: Response) -> Response {
+    resp.headers_mut().remove("mcp-session-id");
+    resp
+}
+
+/// Relais avec une session poolée injectee (le `Authorization` reste celui du
+/// client : meme emetteur, meme magasin). `None` (parse impossible, ne devrait
+/// pas arriver : identifiants hex) = repli direct.
+async fn forward_as(
+    state: &AppState,
+    path: &str,
+    query: Option<&str>,
+    headers: &axum::http::HeaderMap,
+    body: Option<Vec<u8>>,
+    authorization: String,
+    session: &str,
+) -> Option<Response> {
+    let value: axum::http::HeaderValue = session.parse().ok()?;
+    let mut h = headers.clone();
+    h.insert("mcp-session-id", value);
+    Some(
+        forward(
+            state,
+            &Method::POST,
+            path,
+            query,
+            &h,
+            body,
+            Some(authorization),
+        )
+        .await,
+    )
 }
 
 async fn forward(

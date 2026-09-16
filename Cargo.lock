@@ -2441,7 +2441,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vault-mcp-rs"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "mcp-auth",
@@ -2451,6 +2451,7 @@ dependencies = [
  "mcp-observe",
  "reqwest",
  "serde_json",
+ "sha2",
  "tokio",
  "tower",
  "tracing",

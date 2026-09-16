@@ -300,3 +300,194 @@ async fn pont_fichier_parite_observee_sans_controle_resource() {
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Pont stateless : un upstream stateful strict (400 sans session, comme le
+/// Python) devient stateless vu du client (200 sans session, comme
+/// github/orch), sans toucher aux flux avec session ni a `initialize`.
+///
+/// Le mock mime le manager Python : `initialize` sans session → 200 + session ;
+/// autre methode sans session → 400 + session (comme `_create_error_response`
+/// qui inclut toujours la session du transport) ; session inconnue → 404 ;
+/// session connue → 200 par methode.
+#[tokio::test]
+async fn pont_stateless_client_sans_session() {
+    use axum::body::Body;
+    use axum::extract::Request;
+    use axum::http::{HeaderMap, HeaderValue, StatusCode};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tower::ServiceExt;
+
+    const SESSION: &str = "mock-stateful-session-0001";
+    let initializes = Arc::new(AtomicUsize::new(0));
+    let compteur = Arc::clone(&initializes);
+    let mock = axum::Router::new().route(
+        "/mcp",
+        axum::routing::post(move |req: Request| {
+            let compteur = Arc::clone(&compteur);
+            async move {
+                let (parts, body) = req.into_parts();
+                if parts.headers.get("authorization").and_then(|v| v.to_str().ok())
+                    != Some(format!("Bearer {}", "x".repeat(32)).as_str())
+                {
+                    return (StatusCode::UNAUTHORIZED, HeaderMap::new(), Body::empty());
+                }
+                let bytes = axum::body::to_bytes(body, 65536).await.unwrap_or_default();
+                let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+                let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                let id = v.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                let session = parts
+                    .headers
+                    .get("mcp-session-id")
+                    .and_then(|hv| hv.to_str().ok())
+                    .unwrap_or("");
+                let mut headers = HeaderMap::new();
+                headers.insert("content-type", HeaderValue::from_static("application/json"));
+                // Comme le Python : toute erreur porte la session du transport.
+                headers.insert("mcp-session-id", HeaderValue::from_static(SESSION));
+                if method == "initialize" && session.is_empty() {
+                    compteur.fetch_add(1, Ordering::SeqCst);
+                    let corps = serde_json::json!({"jsonrpc": "2.0", "id": id,
+                        "result": {"protocolVersion": "2025-11-25", "capabilities": {},
+                                   "serverInfo": {"name": "mock", "version": "0"}}});
+                    return (StatusCode::OK, headers, Body::from(corps.to_string()));
+                }
+                if session != SESSION {
+                    if session.is_empty() {
+                        let corps = serde_json::json!({"jsonrpc": "2.0", "id": serde_json::Value::Null,
+                            "error": {"code": -32600, "message": "Bad Request: Missing session ID"}});
+                        return (StatusCode::BAD_REQUEST, headers, Body::from(corps.to_string()));
+                    }
+                    let corps = serde_json::json!({"jsonrpc": "2.0", "id": serde_json::Value::Null,
+                        "error": {"code": -32600, "message": "Session not found"}});
+                    return (StatusCode::NOT_FOUND, HeaderMap::new(), Body::from(corps.to_string()));
+                }
+                let corps = match method {
+                    "tools/list" => serde_json::json!({"jsonrpc": "2.0", "id": id,
+                        "result": {"tools": [{"name": "vault_status"}]}}),
+                    _ => serde_json::json!({"jsonrpc": "2.0", "id": id,
+                        "result": {"content": [{"type": "text", "text": "ok"}]}}),
+                };
+                (StatusCode::OK, headers, Body::from(corps.to_string()))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+    use vault_mcp_rs::{build_router, ServiceConfig};
+    let app_of = || {
+        build_router(ServiceConfig {
+            upstream: format!("http://127.0.0.1:{}", addr.port()),
+            static_token: "x".repeat(32),
+            static_token_scopes: vec![READ_SCOPE.to_string(), WRITE_SCOPE.to_string()],
+            oauth: oauth_cfg(),
+            max_body_bytes: 1024 * 1024,
+        })
+        .unwrap()
+    };
+    let auth = format!("Bearer {}", "x".repeat(32));
+    let envoi = |app: axum::Router, corps: &str, session: Option<&str>| {
+        let auth = auth.clone();
+        let corps = corps.to_string();
+        let session = session.map(str::to_string);
+        async move {
+            let mut b = Request::post("/mcp")
+                .header("authorization", auth)
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream");
+            if let Some(s) = session {
+                b = b.header("mcp-session-id", s);
+            }
+            app.oneshot(b.body(Body::from(corps)).unwrap())
+                .await
+                .unwrap()
+        }
+    };
+
+    // 1) tools/list SANS session → 200 ponte, reponse SANS session (stateless).
+    // Une seule facade pour les cas pontes : le cache doit eviter tout nouvel
+    // `initialize` upstream entre deux appels du meme credential.
+    let app = app_of();
+    let res = envoi(
+        app.clone(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#,
+        None,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(
+        res.headers().get("mcp-session-id").is_none(),
+        "le client stateless ne recoit pas de session"
+    );
+    let bytes = axum::body::to_bytes(res.into_body(), 4096).await.unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["result"]["tools"][0]["name"], "vault_status");
+    assert_eq!(initializes.load(Ordering::SeqCst), 1);
+
+    // 2) Meme appel : 200 via le cache, PAS de nouvel initialize upstream.
+    let res = envoi(
+        app.clone(),
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#,
+        None,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        initializes.load(Ordering::SeqCst),
+        1,
+        "session poolée reutilisee, pas de nouvel initialize"
+    );
+
+    // 3) initialize SANS session : relais direct, session conservee.
+    let res = envoi(
+        app_of(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+        None,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok()),
+        Some(SESSION)
+    );
+
+    // 4) tools/list AVEC session inconnue : relais direct 404 verbatim.
+    let res = envoi(
+        app_of(),
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/list","params":{}}"#,
+        Some("session-inconnue-0000000000000000"),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    // 5) tools/call connu SANS session → 200 ponte (meme facade, cache).
+    let res = envoi(
+        app,
+        r#"{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"vault_status","arguments":{}}}"#,
+        None,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        initializes.load(Ordering::SeqCst),
+        2,
+        "pas de 3e initialize : 1 pont (cas 1-2-5) + 1 direct (cas 3)"
+    );
+
+    // 6) Notification sans session : relais direct (le mock repond 400 + session).
+    let res = envoi(
+        app_of(),
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        None,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
