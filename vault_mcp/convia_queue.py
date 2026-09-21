@@ -195,6 +195,7 @@ def _is_conversation(path: Path) -> bool:
 
 SUPERSEDED = "superseded"
 BLOCKED = "blocked"
+MISSING = "missing"
 
 # Motifs de blocage : le consommateur ChatGPT ne peut définitivement pas
 # lire/analyser la conversation (refus plateforme répété, lecture impossible).
@@ -202,7 +203,7 @@ BLOCKED = "blocked"
 # requeue admin (`requeue_blocked`) ou une NOUVELLE version de la source
 # (nouveau hash → nouvelle ligne `pending`) remet l'unité en file. La ligne
 # n'est jamais supprimée, la source jamais touchée.
-BLOCKED_ACTIONS = ("blocked", "requeued")
+BLOCKED_ACTIONS = ("blocked", "requeued", "missing", "reappeared")
 
 
 def _supersede(conn: sqlite3.Connection, source_path: str, keep_hash: str) -> int:
@@ -217,7 +218,7 @@ def _supersede(conn: sqlite3.Connection, source_path: str, keep_hash: str) -> in
     """
     cur = conn.execute(
         "UPDATE pending_analysis SET status = ? WHERE source_path = ? AND source_hash != ?"
-        " AND version = ? AND status = 'pending'",
+        " AND version = ? AND status IN ('pending', 'missing')",
         (SUPERSEDED, source_path, keep_hash, ANALYSIS_VERSION),
     )
     return cur.rowcount or 0
@@ -248,7 +249,8 @@ def scan(limit: int = 0) -> dict[str, int]:
     plusieurs secondes pour aucune information nouvelle.
     """
     stats = {"vus": 0, "nouveaux": 0, "modifies": 0, "inchanges": 0,
-             "reprises": 0, "mal_places": 0, "remplacees": 0}
+             "reprises": 0, "mal_places": 0, "remplacees": 0,
+             "manquantes": 0, "reparues": 0}
     if not RAW_ROOT.is_dir():
         return stats
     stats["reprises"] = reconcile_lost_analyses()
@@ -316,6 +318,10 @@ def scan(limit: int = 0) -> dict[str, int]:
             stats["modifies" if previous else "nouveaux"] += 1
             if limit and (stats["nouveaux"] + stats["modifies"]) >= limit:
                 break
+        divergent = _reconcile_missing(conn, seen_paths, completude_totale=not (
+            limit and (stats["nouveaux"] + stats["modifies"]) >= limit))
+        stats["manquantes"] += divergent["manquantes"]
+        stats["reparues"] += divergent["reparues"]
         conn.execute(
             "INSERT INTO scan_state (cle, valeur) VALUES ('last_scan', ?)"
             " ON CONFLICT(cle) DO UPDATE SET valeur = excluded.valeur",
@@ -371,6 +377,104 @@ def reconcile_lost_analyses() -> int:
     finally:
         conn.close()
     return remises
+
+
+def _reconcile_missing(conn: sqlite3.Connection, seen_paths: set[str],
+                       completude_totale: bool = True) -> dict[str, int]:
+    """Parque les `pending` dont la source a disparu du miroir, sans rien perdre.
+
+    Cause racine du backlog bloque (mesure le 2026-09-14) : une ligne `pending`
+    dont le `source_path` n'existe plus sur disque restait `pending` pour
+    toujours — `scan` ne la touchait pas (`_supersede` ne visait qu'un chemin
+    present avec un nouveau hash) — et squattait la TETE de file (ordre
+    `event_id ASC`), rendant `list_pending` + `read_for_analysis` inoperants
+    sur les unites servies en premier.
+
+    Statut `missing` : exclu de `list_pending` / `pending_count` (qui filtrent
+    `status = 'pending'`), ligne conservee, transition auditee dans
+    `blocked_events`, REVERSIBLE : si le fichier reparait avec le meme hash, la
+    ligne repasse `pending` (action `reappeared`) ; avec un nouveau hash, la
+    nouvelle ligne inseree par le scan gagne et l'ancienne est `superseded`
+    (via `_supersede`, etendu aux lignes `missing`). Une absence temporaire du
+    miroir (sync Drive, 30 min) ne perd donc jamais une conversation valide.
+    La source n'est jamais touchee, aucune ligne n'est supprimee.
+
+    `completude_totale=False` (scan interrompu par `limit`) : le sens
+    `pending -> missing` est DESACTIVE — `seen_paths` partiel ne permet pas de
+    distinguer « absent du miroir » de « pas encore balaye ». Le sens
+    `missing -> pending` reste sur : un chemin vu existe reellement.
+    """
+    res = {"manquantes": 0, "reparues": 0}
+    now = _now()
+    rows = conn.execute(
+        "SELECT event_id, source_path, source_hash, status FROM pending_analysis"
+        " WHERE version = ? AND status IN ('pending', 'missing')"
+        " ORDER BY event_id ASC",
+        (ANALYSIS_VERSION,),
+    ).fetchall()
+    for row in rows:
+        rel = row["source_path"]
+        etat = row["status"]
+        if etat == "pending" and rel not in seen_paths:
+            if not completude_totale:
+                continue
+            conn.execute(
+                "UPDATE pending_analysis SET status = ? WHERE event_id = ?",
+                (MISSING, row["event_id"]),
+            )
+            conn.execute(
+                "INSERT INTO blocked_events (at, source_path, source_hash, action,"
+                " reason, actor) VALUES (?,?,?,?,?,?)",
+                (now, rel, row["source_hash"], "missing",
+                 "source absente du miroir", "scan"),
+            )
+            res["manquantes"] += 1
+        elif etat == "missing" and rel in seen_paths:
+            disk = _disk_of(rel)
+            try:
+                digest = sha256_of(disk) if disk.is_file() else None
+            except OSError:
+                continue
+            if digest is None or digest != row["source_hash"]:
+                continue
+            conn.execute(
+                "UPDATE pending_analysis SET status = 'pending' WHERE event_id = ?",
+                (row["event_id"],),
+            )
+            conn.execute(
+                "INSERT INTO blocked_events (at, source_path, source_hash, action,"
+                " reason, actor) VALUES (?,?,?,?,?,?)",
+                (now, rel, row["source_hash"], "reappeared",
+                 "source reparue dans le miroir", "scan"),
+            )
+            res["reparues"] += 1
+    return res
+
+
+def _disk_of(rel: str) -> Path:
+    """Chemin disque d'un `source_path` logique, confine sous RAW_ROOT."""
+    prefix = "raw/assets/ConvIA/"
+    suffix = rel[len(prefix):] if rel.startswith(prefix) else rel
+    return RAW_ROOT / suffix
+
+
+def list_missing(limit: int = 50) -> list[dict[str, object]]:
+    """Unites garees (`missing`), les plus anciennes d'abord. Lecture seule."""
+    conn = connect()
+    try:
+        return [
+            {"event_id": row["event_id"], "path": row["source_path"],
+             "source": row["source_agent"], "session_id": row["session_id"],
+             "title": row["title"], "hash": row["source_hash"]}
+            for row in conn.execute(
+                "SELECT event_id, source_path, source_agent, session_id, title,"
+                " source_hash FROM pending_analysis"
+                " WHERE status = ? AND version = ? ORDER BY event_id ASC LIMIT ?",
+                (MISSING, ANALYSIS_VERSION, max(1, min(limit or 50, 200))),
+            )
+        ]
+    finally:
+        conn.close()
 
 
 def list_pending(limit: int = 10, sources: list[str] | None = None) -> list[PendingItem]:
@@ -639,6 +743,7 @@ def status() -> dict[str, object]:
             "analysis_done": counts.get("done", 0),
             "analysis_superseded": counts.get(SUPERSEDED, 0),
             "analysis_blocked": counts.get(BLOCKED, 0),
+            "analysis_missing": counts.get(MISSING, 0),
             "pending_by_source": by_source,
             "oldest_analysis_pending": dict(oldest) if oldest else None,
             "last_analysis": dict(last) if last else None,

@@ -46,8 +46,10 @@ import contextlib
 import errno
 import fcntl
 import json
+import logging
 import os
 import re
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -57,8 +59,11 @@ from pathlib import Path
 import numpy as np
 from numpy.typing import NDArray
 
+from vault_mcp.autorite import historique, rang_autorite
 from vault_mcp.chunk import fragmenter
 from vault_mcp.embed import DIMENSIONS, vectoriser, vectoriser_un
+from vault_mcp.lexical import IndexBM25
+from vault_mcp.selection import indexable, notes, repertoire_vault
 
 INDEX_DEFAUT = Path("/opt/vault-mcp/index")
 FICHIER_VECTEURS = "vectors.npy"
@@ -366,12 +371,62 @@ class Instantane:
         return self._noms
 
 
+# Reconstruction BM25 au plus une fois par intervalle : le worker incremental publie
+# souvent, et chaque construction coute ~80 s de CPU sur l'index reel.
+BM25_INTERVALLE_S = float(os.environ.get("VAULT_MCP_BM25_INTERVALLE_S", "900"))
+BM25_SYNCHRONE_MAX = 5000
+
+
+def poids_autorite() -> float:
+    """Poids du prior d'autorite dans la fusion (0 = desactive). Voir `autorite.py`."""
+    return float(os.environ.get("VAULT_MCP_POIDS_AUTORITE", "2.0"))
+
+
+@dataclass(frozen=True)
+class _Bm25:
+    generation: int
+    construit_a: float
+    metas: list[MetaFragment]
+    index: IndexBM25
+
+
+def textes_complets(metas: Sequence[MetaFragment], racine: Path) -> list[str]:
+    """Texte complet de chaque fragment, re-fragmente depuis le miroir.
+
+    `fragmenter` est deterministe : (chemin, rang) designe le meme fragment tant que
+    la note n'a pas change. Note absente, illisible ou modifiee depuis l'indexation
+    (debut de texte different de l'apercu) : on garde titre + apercu, soit exactement
+    ce que voyait l'ancien lexical.
+    """
+    voulues = {m.chemin for m in metas}
+    par_note: dict[str, dict[int, str]] = {}
+    for fichier in notes(racine) if racine.is_dir() else []:
+        relatif = fichier.relative_to(racine).as_posix()
+        if relatif not in voulues:
+            continue
+        try:
+            contenu = fichier.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        par_note[relatif] = {f.rang: f.texte for f in fragmenter(relatif, contenu)}
+    sortie: list[str] = []
+    for meta in metas:
+        texte = par_note.get(meta.chemin, {}).get(meta.rang)
+        debut = meta.apercu[:200]
+        if texte is None or not texte[:200].replace("\n", " ").startswith(debut):
+            texte = f"{meta.titre} {meta.apercu}"
+        sortie.append(texte)
+    return sortie
+
+
 class Index:
     """Index charge en lecture seule. `vecteurs` est mappe en memoire, pas copie."""
 
     def __init__(self, repertoire: Path | None = None) -> None:
         self._repertoire = repertoire or repertoire_index()
         self._instantane: Instantane | None = None
+        self._bm25: _Bm25 | None = None
+        self._bm25_verrou = threading.Lock()
 
     @property
     def repertoire(self) -> Path:
@@ -507,6 +562,20 @@ class Index:
         # Mesure sur le jeu de reference : max 5/20, moyenne 9/20.
         classement: list[tuple[float, str, int]] = []
         for chemin, lignes in instantane.fragments_par_note.items():
+            # Meme garde que `recherche_hybride` : un index publie avant une
+            # nouvelle exclusion garde ces chemins jusqu'au full suivant, donc le
+            # filtre doit vivre a la LECTURE et pas seulement a l'indexation.
+            #
+            # Ce moteur est expose directement par `search_vault(mode="vecteur")`
+            # ET emprunte par le repli de `recherche_hybride` tant que le BM25
+            # plein texte n'est pas construit. Sans cette garde il servait des
+            # notes de `.trash-wiki-publish/` en tete de classement.
+            # Mesure du 2026-09-18, banc de 54 questions, index reel, regime
+            # froid : 11 des 54 reponses contenaient un chemin de corbeille dans
+            # leur top-10. Apres : 0, et Recall@10 0,611 -> 0,667, MRR 0,457 ->
+            # 0,556. Le regime a chaud, lui, filtrait deja et ne bouge pas.
+            if not indexable(chemin):
+                continue
             valeurs = scores[lignes]
             meilleur = int(lignes[int(np.argmax(valeurs))])
             classement.append((float(valeurs.mean()), chemin, meilleur))
@@ -534,8 +603,13 @@ class Index:
         mots = {m.lower() for m in _MOT.findall(requete)}
         if not mots:
             return []
-        resultats: list[Resultat] = []
+        # Voie fraiche en tete : une note pas encore indexee n'a pas d'autre chance.
+        indexees = self._courant().fragments_par_note
+        resultats: list[Resultat] = [r for r in _frais(requete, limit) if r.chemin not in indexees]
         for meta in self._courant().metas:
+            # Meme garde que `recherche_hybride` : cf. `recherche_vectorielle`.
+            if not indexable(meta.chemin):
+                continue
             corpus = f"{meta.titre} {meta.apercu} {meta.chemin}".lower()
             touches = sum(1 for mot in mots if mot in corpus)
             if touches:
@@ -552,12 +626,152 @@ class Index:
         return _dedupliquer(resultats, limit)
 
     def recherche_hybride(self, requete: str, limit: int = 10) -> list[Resultat]:
-        """Fusion par rang reciproque des deux listes."""
-        return fusion_rang_reciproque(
-            self.recherche_vectorielle(requete, limit * 2),
-            self.recherche_lexicale(requete, limit * 2),
-            limit,
+        """Fusion par rang reciproque vecteur (mix) + BM25 plein texte, prior d'autorite.
+
+        Mesure 2026-09-14 (scripts/eval_retrieval.py, 40 requetes, index reel) : voir
+        docs/eval-retrieval.md. Retombe sur l'ancien lexical tant que le BM25 n'est pas pret.
+        """
+        instantane = self._courant()
+        pool = max(limit * 5, 20)
+        # Voie fraiche (vault_mcp.frais) : notes du miroir que l'index publie ne
+        # reflete pas encore -- ConvIA arrivees par rclone, lots en attente d'embedding.
+        frais = _frais(requete, pool)
+        if not instantane.metas:
+            return frais[:limit]
+        bm25 = self._bm25_pret(instantane)
+        if bm25 is None:
+            return fusion_rang_reciproque(
+                self.recherche_vectorielle(requete, limit * 2),
+                self.recherche_lexicale(requete, limit * 2),
+                limit,
+            )
+        q = vectoriser_un(requete)
+        scores = np.asarray(instantane.vecteurs, dtype=np.float32) @ q
+        vecteur: list[tuple[float, str, int]] = []
+        for chemin, lignes in instantane.fragments_par_note.items():
+            # Un index publie avant une nouvelle exclusion garde ces notes jusqu'au full.
+            if not indexable(chemin):
+                continue
+            valeurs = scores[lignes]
+            meilleur = int(np.argmax(valeurs))
+            # mix : la moyenne seule noie une note courte et precise, le max seul
+            # favorise les dumps longs. Mesure : MRR 0,468 contre 0,249 (moyenne).
+            note = 0.5 * float(valeurs[meilleur]) + 0.5 * float(valeurs.mean())
+            vecteur.append((note, chemin, int(lignes[meilleur])))
+        vecteur.sort(key=lambda t: -t[0])
+        lexical = self._classement_bm25(bm25, requete, instantane, pool)
+
+        cumul: dict[str, float] = {}
+        ligne_de: dict[str, int] = {}
+        for rang, (_, chemin, ligne) in enumerate(vecteur[:pool]):
+            cumul[chemin] = cumul.get(chemin, 0.0) + 1.0 / (61 + rang)
+            ligne_de[chemin] = ligne
+        for rang, (chemin, ligne) in enumerate(lexical):
+            cumul[chemin] = cumul.get(chemin, 0.0) + 1.0 / (61 + rang)
+            ligne_de.setdefault(chemin, ligne)
+        # La voie fraiche remplace a elle seule vecteur ET BM25 pour une note ABSENTE
+        # de l'index : son poids compense l'absence de seconde liste. Une note deja
+        # indexee garde son classement d'index (garde aussi cote worker, cf. frais.py) :
+        # le lui cumuler faisait regresser le banc -- mesure en prod 2026-09-14.
+        poids_frais = _poids_frais()
+        recents: dict[str, Resultat] = {}
+        for rang, resultat in enumerate(
+            r for r in frais if r.chemin not in instantane.fragments_par_note
+        ):
+            cumul[resultat.chemin] = cumul.get(resultat.chemin, 0.0) + poids_frais / (61 + rang)
+            recents.setdefault(resultat.chemin, resultat)
+        poids = poids_autorite()
+        if poids and not historique(requete):
+            for chemin in cumul:
+                cumul[chemin] += poids * (4 - rang_autorite(chemin)) / 4 / 61
+        ordonnes = sorted(cumul.items(), key=lambda kv: -kv[1])[:limit]
+        sortie: list[Resultat] = []
+        for chemin, score in ordonnes:
+            if chemin in recents:
+                # Le contenu frais est plus recent que l'apercu indexe.
+                r = recents[chemin]
+                sortie.append(Resultat(chemin, r.titre, r.apercu, score, "frais"))
+            else:
+                meta = instantane.metas[ligne_de[chemin]]
+                sortie.append(Resultat(chemin, meta.titre, meta.apercu, score, "hybride"))
+        return sortie
+
+    # ----------------------------------------------------------- BM25 plein texte
+
+    def _bm25_pret(self, instantane: Instantane) -> _Bm25 | None:
+        """BM25 disponible, eventuellement d'une generation anterieure.
+
+        Le BM25 est reconstruit depuis le miroir (le texte complet n'est pas dans
+        l'index) : ~80 s sur 244k fragments. Il est donc construit en arriere-plan et
+        une generation anterieure reste servie en attendant -- son classement est au
+        niveau NOTE, filtre sur les notes encore presentes, donc toujours valide ; seul
+        le texte d'une note modifiee entre-temps est en retard de quelques minutes.
+        Petit index (tests, vault minuscule) : construction synchrone.
+        """
+        courant = self._bm25
+        perime = courant is None or (
+            courant.generation != instantane.signature
+            and time.monotonic() - courant.construit_a >= BM25_INTERVALLE_S
         )
+        # Garde anti-emballement (2026-09-21) : ne pas lancer une reconstruction
+        # de plusieurs minutes sur une generation deja perimee sur disque. Chaque
+        # build epingle son `Instantane` (~350 Mo de metas + mmap) pendant toute
+        # sa duree ; construire sur du perime accumule les generations en RAM.
+        frais = instantane.signature == self._signature_disque()
+        if perime and frais and not self._bm25_verrou.locked():
+            if len(instantane.metas) <= BM25_SYNCHRONE_MAX:
+                self._construire_bm25(instantane)
+            else:
+                threading.Thread(
+                    target=self._construire_bm25, args=(instantane,), daemon=True
+                ).start()
+        return self._bm25
+
+    def _construire_bm25(self, instantane: Instantane) -> None:
+        if not self._bm25_verrou.acquire(blocking=False):
+            return
+        try:
+            if instantane.signature != self._signature_disque():
+                # Devenu perime pendant l'attente du verrou : ne rien construire.
+                return
+            textes = textes_complets(instantane.metas, repertoire_vault())
+            if instantane.signature != self._signature_disque():
+                # Un publish a eu lieu pendant la lecture du miroir (plusieurs
+                # minutes sur 344k fragments) : jeter ce build perime au lieu de
+                # l'assigner et de retenir l'ancienne generation en RAM.
+                # Le prochain `_bm25_pret` repartira sur la generation courante.
+                return
+            bm25 = IndexBM25.construire(
+                [f"{m.chemin} {m.titre} {t}" for m, t in zip(instantane.metas, textes, strict=True)]
+            )
+            if instantane.signature != self._signature_disque():
+                return
+            self._bm25 = _Bm25(instantane.signature, time.monotonic(), instantane.metas, bm25)
+        except Exception:  # noqa: BLE001 -- le lexical historique reste servi
+            logging.getLogger(__name__).exception("construction BM25 echouee")
+        finally:
+            self._bm25_verrou.release()
+
+    @staticmethod
+    def _classement_bm25(
+        bm25: _Bm25, requete: str, instantane: Instantane, limit: int
+    ) -> list[tuple[str, int]]:
+        scores = bm25.index.scores(requete)
+        touches = np.nonzero(scores)[0]
+        meilleur: dict[str, tuple[float, int]] = {}
+        for i in touches[np.argsort(-scores[touches], kind="stable")]:
+            chemin = bm25.metas[int(i)].chemin
+            if chemin in meilleur:
+                continue
+            lignes = instantane.fragments_par_note.get(chemin)
+            if lignes is None or not indexable(chemin):
+                continue
+            rang = bm25.metas[int(i)].rang
+            ligne = next((j for j in lignes if instantane.metas[j].rang == rang), lignes[0])
+            meilleur[chemin] = (float(scores[i]), ligne)
+            if len(meilleur) >= limit:
+                break
+        return [(chemin, ligne) for chemin, (_, ligne) in meilleur.items()]
 
     # ------------------------------------------------------------ reindexation
 
@@ -760,6 +974,22 @@ def fusion_rang_reciproque(
         )
         for chemin, score in ordonnes[:limit]
     ]
+
+
+def _poids_frais() -> float:
+    # 1.0 et non 2.0 : a 2.0 les revues/analyses non indexees evincaient la note
+    # canonique du top 1 (sonde servie 2026-09-15 : MRR 0,62 a 2.0, 0,72 a 1.0).
+    return float(os.environ.get("VAULT_MCP_POIDS_FRAIS", "1.0"))
+
+
+def _frais(requete: str, limit: int) -> list[Resultat]:
+    """Classement de la voie fraiche, vide si desactivee ou absente."""
+    if not _poids_frais():
+        return []
+    # Import tardif : `frais` importe `Resultat` depuis ce module.
+    from vault_mcp import frais
+
+    return frais.rechercher(requete, limit)
 
 
 def _dedupliquer(resultats: list[Resultat], limit: int) -> list[Resultat]:

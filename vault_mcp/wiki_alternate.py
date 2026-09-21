@@ -31,6 +31,7 @@ import re
 import shutil
 import subprocess
 import sys
+import uuid
 import tempfile
 import time
 from pathlib import Path
@@ -39,6 +40,15 @@ from vault_mcp import wiki_jobs as wj
 from vault_mcp import wiki_projection as wp
 
 MODEL_ID = os.environ.get("WIKI_ALT_MODEL", "")
+PROVIDER = os.environ.get("WIKI_ALT_PROVIDER", "opencode").strip().lower()
+AGY_BRIDGE_DIR = Path(os.environ.get("WIKI_ALT_AGY_BRIDGE",
+                                     "/var/lib/llm-wiki/agy"))
+AGY_BRIDGE_POLL_S = float(os.environ.get("WIKI_ALT_AGY_POLL", "2"))
+AGY_MODEL = os.environ.get("WIKI_ALT_AGY_MODEL", "gemini-3.7-flash")
+AGY_EFFORT = os.environ.get("WIKI_ALT_AGY_EFFORT", "medium")
+# Limite d'un argument execve : au-dela le run tombe avant tout appel.
+AGY_PROMPT_MAX = int(os.environ.get("WIKI_ALT_AGY_PROMPT_MAX", "120000"))
+
 OPENCODE_BIN = os.environ.get("WIKI_ALT_OPENCODE", "/usr/local/lib/opencode/opencode")
 AGENT = os.environ.get("WIKI_ALT_AGENT", "extract")
 STATE_DIR = Path(os.environ.get("WIKI_ALT_STATE", "/var/lib/llm-wiki-opencode"))
@@ -209,6 +219,95 @@ def check_model(stderr: bytes) -> None:
     log(f"modele {'confirme' if seen else 'NON confirme par le journal'} : {MODEL_ID}")
 
 
+# ----------------------------------------------------------------- AGY (Gemini)
+# Second fournisseur de la route alternative. Existe parce que les deux transports
+# precedents peuvent tomber en meme temps : bridge ChatGPT en CHALLENGE_REQUIRED et
+# palier gratuit OpenCode ferme (403 « can only be used from within OpenCode ») --
+# file sans consommateur depuis le 2026-09-14. Meme contrat, meme projection
+# caviardee, meme validation : seul l'appel change.
+#
+# AGY est agentique ; ici il ne doit rien faire d'autre que repondre. Les artefacts
+# sont donc INLINE dans le prompt (aucun --add-dir, aucun outil, aucun acces disque
+# au document) et la sortie n'est lue que comme une donnee.
+def _agy_prompt(message: str, files: list[Path]) -> str:
+    morceaux = [message]
+    for f in files:
+        contenu = f.read_text(encoding="utf-8")
+        morceaux.append(f"=== {f.name} ===\n{contenu}\n=== fin {f.name} ===")
+    return "\n\n".join(morceaux)
+
+
+def _bridge_call(prompt: str, title: str) -> str:
+    """Depose la consigne dans le pont AGY et attend la reponse.
+
+    Le worker est confine (NoNewPrivileges, aucune capacite) et n'a ni le profil
+    OAuth ni le droit de changer de compte : c'est agy-bridge.service, sous le
+    compte detenteur du profil, qui execute l'appel. Voir /usr/local/bin/agy_bridge.py.
+    """
+    ident = f"{title}-{uuid.uuid4().hex[:12]}"
+    req = AGY_BRIDGE_DIR / f"{ident}.req"
+    res = AGY_BRIDGE_DIR / f"{ident}.res"
+    err = AGY_BRIDGE_DIR / f"{ident}.err"
+    tmp = AGY_BRIDGE_DIR / f"{ident}.req.depot"
+    try:
+        tmp.write_text(prompt, encoding="utf-8")
+        os.chmod(tmp, 0o660)
+        tmp.rename(req)  # publication atomique : jamais de consigne tronquee
+    except OSError as exc:
+        raise ProviderError("agy", f"pont indisponible : {exc.strerror}") from exc
+    limite = time.monotonic() + CALL_TIMEOUT_S + 180
+    try:
+        while time.monotonic() < limite:
+            if res.is_file():
+                return res.read_text(encoding="utf-8")
+            if err.is_file():
+                raise ProviderError("agy", err.read_text(encoding="utf-8")[:200])
+            time.sleep(AGY_BRIDGE_POLL_S)
+        raise ProviderError("timeout", f"pont AGY muet en {CALL_TIMEOUT_S + 180}s")
+    finally:
+        for f in (tmp, req, res, err):
+            with contextlib.suppress(OSError):
+                f.unlink()
+
+
+def run_agy(message: str, files: list[Path], title: str, workdir: Path) -> str:
+    prompt = _agy_prompt(message, files)
+    taille = len(prompt.encode("utf-8"))
+    if taille > AGY_PROMPT_MAX:
+        # Propre a CE document (projection trop grosse) : tentative consommee plutot
+        # qu'un backoff global qui figerait toute la file.
+        raise ModelOutputError([f"projection trop longue pour un appel AGY ({taille} o)"])
+    ligne = _bridge_call(prompt, f"wiki-{title[-8:]}").strip()
+    try:
+        ev = json.loads(ligne)
+    except ValueError as exc:
+        raise ProviderError("agy", f"sortie AGY illisible : {exc}") from exc
+    if str(ev.get("status") or "").upper() != "SUCCESS":
+        blob = json.dumps(ev, ensure_ascii=False)[:2000]
+        if _CONTENT_REFUSAL.search(blob) and classify_failure(blob) not in ("rate_limit", "auth"):
+            raise ModelOutputError(["refus de contenu par le provider"])
+        raise ProviderError(classify_failure(blob),
+                            f"status={ev.get('status')} "
+                            + wp.redact(str(ev.get("error") or "")[:200])[0])
+    usage = ev.get("usage") if isinstance(ev.get("usage"), dict) else {}
+    log(f"modele confirme : {AGY_MODEL} ({ev.get('duration_seconds')}s,"
+        f" {usage.get('total_tokens')} tokens)")
+    return str(ev.get("response") or "")
+
+
+def run_provider(message: str, files: list[Path], title: str, workdir: Path) -> str:
+    """Aiguillage du fournisseur de la route alternative (WIKI_ALT_PROVIDER)."""
+    if PROVIDER == "agy":
+        return run_agy(message, files, title, workdir)
+    if PROVIDER == "opencode":
+        return run_opencode(message, files, title, workdir)
+    raise ProviderError("config", f"WIKI_ALT_PROVIDER inconnu : {PROVIDER}")
+
+
+def model_courant() -> str:
+    return AGY_MODEL if PROVIDER == "agy" else MODEL_ID
+
+
 # ------------------------------------------------------------ reponse modele
 _FENCED = re.compile(r"\A```(?:json)?[ \t]*\n(.*)\n```\Z", re.S)
 
@@ -376,7 +475,7 @@ def process_job(job: dict, workdir: Path) -> str:
             message = MESSAGE_RETRY
         t0 = time.monotonic()
         try:
-            text = run_opencode(message, files, f"wiki-{jid[:8]}", workdir)
+            text = run_provider(message, files, f"wiki-{jid[:8]}", workdir)
             provider_ok()  # le provider a repondu, quel que soit le contenu
             extraction = parse_extraction(text)
             errs = evidence_errors(extraction, proj.text) + secret_errors(extraction)
@@ -396,7 +495,7 @@ def process_job(job: dict, workdir: Path) -> str:
             continue
         try:
             res = wj.submit(jid, lid, fen, str(doc["contract_version"]), extraction,
-                            job["contract_digest"], model=MODEL_ID)
+                            job["contract_digest"], model=model_courant())
         except wj.WikiJobsError as exc:
             # Refus au submit malgre la validation a blanc (course sur un slug) :
             # submit a deja compte la tentative dans la route alternative.
@@ -406,7 +505,7 @@ def process_job(job: dict, workdir: Path) -> str:
                 notify_job_failed(doc, wj.MAX_ALT_ATTEMPTS, str(exc))
             return "submit-refused"
         log(f"job={jid[:8]} soumis receipt={res['receipt_id']} duplicate={res['duplicate']}"
-            f" model={MODEL_ID} ms={int((time.monotonic() - t0) * 1000)}")
+            f" model={model_courant()} ms={int((time.monotonic() - t0) * 1000)}")
         return "submitted"
 
 

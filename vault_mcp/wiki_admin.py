@@ -37,6 +37,11 @@ def main(argv: list[str] | None = None) -> int:
     rq.add_argument("--target", choices=("pending", "alternate"), default="pending")
     rq.add_argument("--apply", action="store_true")
     rq.add_argument("--cause", default="")
+    of = sub.add_parser("offload", help="file ChatGPT -> route alternative"
+                        " (dry-run par defaut)")
+    of.add_argument("--limit", type=int, default=50)
+    of.add_argument("--apply", action="store_true")
+    of.add_argument("--cause", default="")
     sk = sub.add_parser("skip", help="quarantaine -> terminal_skip (source vide/inutile)")
     sk.add_argument("--job", action="append", required=True)
     sk.add_argument("--apply", action="store_true")
@@ -52,6 +57,9 @@ def main(argv: list[str] | None = None) -> int:
             _print(wiki_jobs.requeue(job_ids=a.job or None, reason_like=a.reason,
                                      limit=a.limit, dry_run=not a.apply, cause=a.cause,
                                      target=a.target, actor="wiki_admin"))
+        elif a.cmd == "offload":
+            _print(wiki_jobs.offload(limit=a.limit, dry_run=not a.apply,
+                                     cause=a.cause, actor="wiki_admin"))
         elif a.cmd == "skip":
             _print(wiki_jobs.terminal_skip(a.job, a.cause, dry_run=not a.apply,
                                            actor="wiki_admin"))

@@ -25,6 +25,7 @@ from pathlib import Path
 
 import numpy as np
 
+from vault_mcp import dirty
 from vault_mcp.chunk import fragmenter
 from vault_mcp.embed import vectoriser
 from vault_mcp.index import (
@@ -129,6 +130,8 @@ def main() -> int:
         return verifier(racine, repertoire)
 
     debut = time.time()
+    # Horodatage pris AVANT toute lecture du miroir : voir poser_seuil plus bas.
+    debut_ns = time.time_ns()
     # Le verrou couvre la LECTURE du miroir autant que la publication. Le prendre
     # seulement au moment de publier laisserait le scenario que l'on veut fermer :
     # le full lit le miroir a T0, un lot incremental publie N+1 a T0+1 h, le full
@@ -143,6 +146,22 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+    # Le full EST une reconciliation complete : il reconstruit l'index a partir de
+    # l'integralite du miroir, donc tout ecart anterieur a `debut_ns` est resorbe
+    # par construction. Sans cet appel, SEULE la reconciliation bornee de
+    # `scripts/index_worker.py` avancait le seuil -- or elle refuse de tourner
+    # au-dela de RECONCILIATION_MAXIMUM ecarts et delegue justement au full.
+    # Le seuil restait donc fige a la creation de `dirty/` et la reconciliation
+    # etait desarmee en permanence (constate le 2026-09-18 : seuil du 15/09,
+    # ~2800 ecarts refuses a chaque passage).
+    # L'horodatage est celui d'AVANT la lecture du miroir : ce qui change pendant
+    # le full sera revu au parcours suivant, jamais oublie.
+    try:
+        dirty.poser_seuil_reconciliation(debut_ns)
+    except OSError as exc:
+        # Ne pas faire echouer un full reussi pour autant : l'index est publie.
+        # On le signale bruyamment, la reconciliation repartira du seuil precedent.
+        print(f"seuil de reconciliation non pose : {exc}", file=sys.stderr)
     duree = time.time() - debut
     distinctes = len({m.chemin for m in metas})
     print(
