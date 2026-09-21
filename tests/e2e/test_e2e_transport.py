@@ -19,8 +19,17 @@ from tests.e2e.harness import REPO, TOKEN, Bench, RawClient, ToolRefusedError, s
 pytestmark = pytest.mark.e2e
 
 
-def _calls(bench: Bench, at_least: int = 1, timeout: float = 5.0) -> list[dict]:
-    """La ligne est ecrite APRES l'envoi de la reponse : attendre qu'elle arrive."""
+def _calls(bench: Bench, at_least: int = 1, timeout: float = 5.0,
+           match=None) -> list[dict]:
+    """La ligne est ecrite APRES l'envoi de la reponse : attendre qu'elle arrive.
+
+    Sans `match`, attend au moins `at_least` lignes (comportement historique).
+    Avec `match`, attend qu'une ligne satisfasse le predicat : un appel reussi
+    n'implique pas que SA ligne de telemetrie soit deja visible quand des lignes
+    anterieures existent (race constatee sur `convia_status`, CI 2026-09-21).
+    Borne dans tous les cas par `timeout`, sans jamais masquer un vrai echec :
+    une ligne en erreur ne satisfait pas le predicat et l'assert final echoue.
+    """
     deadline = time.monotonic() + timeout
     rows: list[dict] = []
     while time.monotonic() < deadline:
@@ -28,7 +37,10 @@ def _calls(bench: Bench, at_least: int = 1, timeout: float = 5.0) -> list[dict]:
             rows = bench.sql("telemetry.db", "SELECT * FROM mcp_calls ORDER BY id")
         except Exception:  # noqa: BLE001 -- base pas encore creee
             rows = []
-        if len(rows) >= at_least:
+        if match is not None:
+            if any(match(c) for c in rows):
+                return rows
+        elif len(rows) >= at_least:
             return rows
         time.sleep(0.05)
     return rows
@@ -44,7 +56,8 @@ def _telemetry_cli(bench: Bench, *args: str) -> str:
 def test_client_sdk_officiel(bench: Bench) -> None:
     data = sdk_call(bench.url, "convia_status", {})
     assert "analysis_pending" in data
-    calls = _calls(bench)
+    calls = _calls(bench, match=lambda c: c["tool"] == "convia_status"
+                   and c["outcome"] == "ok")
     assert any(c["tool"] == "convia_status" and c["outcome"] == "ok" for c in calls)
 
 

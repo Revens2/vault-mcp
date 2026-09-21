@@ -35,7 +35,13 @@ from vault_mcp.ecriture import (
     empreinte_octets,
     reecrire_wikilinks,
 )
-from vault_mcp.index import Index, VerrouOccupe, extraire_wikilinks, repertoire_index
+from vault_mcp.index import (
+    FICHIER_META,
+    Index,
+    VerrouOccupe,
+    extraire_wikilinks,
+    repertoire_index,
+)
 from vault_mcp.mirror_store import MirrorStore
 from vault_mcp.oauth import PORTEE, PORTEE_ECRITURE, PORTEES, FournisseurOAuth
 from vault_mcp.safety import (
@@ -46,7 +52,7 @@ from vault_mcp.safety import (
     valider_dossier,
     valider_ecriture,
 )
-from vault_mcp import __version__, convia_mcp, convia_queue, dirty
+from vault_mcp import __version__, convia_mcp, convia_queue, dirty, frais
 from vault_mcp.secrets import masquer
 from vault_mcp.spool import Spool, SpoolError
 from vault_mcp.store import StoreError
@@ -1057,13 +1063,26 @@ def vault_status() -> dict[str, object]:
     if _index.disponible:
         etat["index_fragments"] = len(_index.metas)
         etat["index_notes"] = len(_index.fragments_par_note)
+    # Notes trouvables par search_vault AVANT leur embedding (vault_mcp.frais).
+    etat.update(frais.statistiques())
     return etat
 
 
 def _age_index_s() -> float | None:
-    """Anciennete de l index en secondes, ou None s il est absent."""
+    """Anciennete de l index en secondes, ou None s il est absent.
+
+    On date `meta.json` : c est le SEUL point de bascule de `sauvegarder()`, donc
+    le seul fichier dont le mtime marque la publication d une generation.
+
+    Avant le 2026-09-18 cette fonction datait `backlinks.json`. Depuis que les
+    vecteurs et les backlinks portent leur generation dans leur NOM
+    (`backlinks.<gen>.json`, cf. `vault_mcp/index.py`), ce fichier n existe plus :
+    le `stat()` levait donc toujours OSError et `index_age_s` valait `null` alors
+    meme que l index venait d etre republie. `vault_mcp/contexte.py` datait deja
+    `meta.json`, correctement.
+    """
     try:
-        fichier = repertoire_index() / "backlinks.json"
+        fichier = repertoire_index() / FICHIER_META
         return round(time.time() - fichier.stat().st_mtime, 1)
     except OSError:
         return None

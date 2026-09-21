@@ -1558,6 +1558,57 @@ def events(job_id: str, limit: int = 50) -> list[dict[str, object]]:
 
 
 # ------------------------------------------------------------------ status
+_OFFLOADABLE = ("pending", "deferred")
+
+
+def offload(limit: int = 50, dry_run: bool = True, cause: str = "",
+            actor: str = "admin") -> dict[str, object]:
+    """Bascule en masse la file ChatGPT vers la route alternative.
+
+    Le routage nominal est une decision du consommateur ChatGPT
+    (release(action="alternate")). Quand ce transport est mort -- bridge en
+    CHALLENGE_REQUIRED, compte bloque -- la file `pending` n'a plus de
+    consommateur et le worker alternatif tourne a vide : rien ne se draine.
+    Cette bascule administrative existe pour ce cas : lot borne, dry-run par
+    defaut, meme tracabilite que `requeue`.
+
+    Ne touche jamais un job `leased` (bail ChatGPT en cours) ni une quarantaine
+    (role de `requeue`). Les budgets de la route alternative sont remis a zero :
+    de ce cote le job n'a jamais ete tente.
+    """
+    if not dry_run and not cause.strip():
+        raise WikiJobsError("cause obligatoire hors dry-run")
+    borne = max(1, min(int(limit or 1), 2000))
+    conn = connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = conn.execute(
+            "SELECT * FROM wiki_jobs WHERE contract_version=? AND status IN (?,?)"
+            " ORDER BY created_at ASC LIMIT ?",
+            (CONTRACT_VERSION, _OFFLOADABLE[0], _OFFLOADABLE[1], borne)).fetchall()
+        done = []
+        for r in rows:
+            if dry_run:
+                done.append(_admin_line(r, ALT_PENDING))
+                continue
+            _event(conn, r, "offload-alternate", ALT_PENDING, actor, cause.strip())
+            cur = conn.execute(
+                "UPDATE wiki_jobs SET status=?, route='alternate', attempts_alternate=0,"
+                " provider_failures=0, alt_next_at=NULL, alt_reason=?, lease_id=NULL,"
+                " expires_at=NULL, last_error=?, updated_at=? WHERE job_id=? AND status=?",
+                (ALT_PENDING, f"offload: {cause.strip()}"[:300],
+                 f"offload: {cause.strip()}"[:300], _now_iso(), r["job_id"], r["status"]))
+            if cur.rowcount == 1:
+                done.append(_admin_line(r, ALT_PENDING))
+        conn.commit()
+    finally:
+        conn.close()
+    if done and not dry_run:
+        _touch_alternate_request()
+    return {"dry_run": dry_run, "target": ALT_PENDING, "count": len(done),
+            "jobs": done[:20], "tronque": max(0, len(done) - 20)}
+
+
 def status() -> dict[str, object]:
     conn = connect()
     try:
