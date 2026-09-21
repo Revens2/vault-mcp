@@ -17,18 +17,30 @@ import vault_mcp.embed as E
 
 
 def test_cache_une_connexion_par_thread(tmp_path, monkeypatch):
+    """Quatre threads demarrant ensemble obtiennent 4 connexions, sans erreur.
+
+    La barriere maximise la contention sur la premiere creation (base
+    inexistante) : sans le verrou de creation, c'est ici que la CI voyait
+    `OperationalError('database is locked')` par intermittence (2026-09-21).
+    """
     monkeypatch.setenv("VAULT_MCP_EMBED_CACHE", str(tmp_path / "cache.sqlite"))
     monkeypatch.setattr(E, "CACHE_VECTEURS", tmp_path / "cache.sqlite")
     E._etat_fil.__dict__.clear()
 
+    barriere = threading.Barrier(4)
     connexions = []
     erreurs = []
+    verrou_listes = threading.Lock()
 
     def travail():
         try:
-            connexions.append(E._cache())
+            barriere.wait(timeout=10)
+            conn = E._cache()
+            with verrou_listes:
+                connexions.append(conn)
         except Exception as exc:  # noqa: BLE001
-            erreurs.append(exc)
+            with verrou_listes:
+                erreurs.append(exc)
 
     fils = [threading.Thread(target=travail) for _ in range(4)]
     [t.start() for t in fils]

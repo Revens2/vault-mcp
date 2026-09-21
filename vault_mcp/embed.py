@@ -48,14 +48,24 @@ CACHE_ACTIF = os.environ.get("VAULT_MCP_EMBED_CACHE_ACTIF", "1") not in ("0", ""
 # « SQLite objects created in a thread can only be used in that same thread »
 # et retombait sur un calcul ONNX complet (constate en prod 2026-09-21).
 # En WAL + busy_timeout, lecteurs concurrents et ecrivain bref coexistent.
+# Le verrou ne couvre que la PREMIERE creation par thread : sans lui, N threads
+# demarrant ensemble (boot du serveur) peuvent se disputer le DDL initial
+# (« database is locked », constate en CI 2026-09-21). Apres creation, chaque
+# thread n'utilise que sa connexion, sans verrou.
 _etat_fil = threading.local()
+_verrou_creation = threading.Lock()
 
 
 def _cache() -> Any:
     import sqlite3
 
     conn = getattr(_etat_fil, "conn", None)
-    if conn is None:
+    if conn is not None:
+        return conn
+    with _verrou_creation:
+        conn = getattr(_etat_fil, "conn", None)
+        if conn is not None:
+            return conn
         CACHE_VECTEURS.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(CACHE_VECTEURS, timeout=30)
         # WAL : le worker incremental et le full peuvent lire en meme temps ; les
