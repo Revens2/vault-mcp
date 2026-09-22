@@ -45,6 +45,7 @@ from __future__ import annotations
 import contextlib
 import errno
 import fcntl
+import gc
 import json
 import logging
 import os
@@ -228,6 +229,19 @@ def _ecrire_json(cible: Path, donnees: object) -> None:
         flux.flush()
         os.fsync(flux.fileno())
     os.chmod(cible, MODE_INDEX)
+
+
+def _fermer_vecteurs(vecteurs: object) -> None:
+    """Ferme le mmap sous-jacent d'une matrice `np.load(mmap_mode="r")`.
+
+    Sans cela, l'ancien `vectors.<gen>.npy` reste en RAM comme mapping
+    `(deleted)` (FD + `r--s`) apres `_purger_generations`, constate en prod
+    le 22/09/2026 (528 Mo epingles). Inoffensif sur un ndarray alloue.
+    """
+    mmap = getattr(vecteurs, "_mmap", None)
+    if mmap is not None:
+        with contextlib.suppress(OSError, ValueError):
+            mmap.close()
 
 
 def _generation_courante(repertoire: Path) -> int:
@@ -515,11 +529,32 @@ class Index:
                 backlinks={},
             )
         if self._instantane is None or actuelle != self._instantane.signature:
+            ancien = self._instantane
             self._instantane = self._charger()
+            # Libere l'ancien mmap des que plus personne ne le reference via
+            # cet Index. Les recherches/BM25 qui epinglent encore l'ancien
+            # `Instantane` le retiennent vivant : c'est voulu, mais le cas
+            # courant (aucune recherche concurrente) rend 0.5 Go au kernel
+            # au lieu de le laisser en `(deleted)`.
+            if ancien is not None:
+                try:
+                    import sys as _sys
+
+                    if _sys.getrefcount(ancien) <= 3:
+                        _fermer_vecteurs(ancien.vecteurs)
+                except Exception:  # noqa: BLE001 - liberation opportuniste
+                    pass
         return self._instantane
 
-    def invalider(self) -> None:
-        """Force la relecture au prochain acces (a appeler apres avoir pris le verrou)."""
+    def invalider(self, fermer: bool = False) -> None:
+        """Force la relecture au prochain acces (a appeler apres avoir pris le verrou).
+
+        `fermer=True` : ferme aussi le mmap courant (writer apres publish).
+        Par defaut on ne ferme pas : des recherches concurrentes peuvent encore
+        epingler l'instantane.
+        """
+        if fermer and self._instantane is not None:
+            _fermer_vecteurs(self._instantane.vecteurs)
         self._instantane = None
 
     # ------------------------------------------------------------- proprietes
@@ -730,6 +765,8 @@ class Index:
     def _construire_bm25(self, instantane: Instantane) -> None:
         if not self._bm25_verrou.acquire(blocking=False):
             return
+        log = logging.getLogger(__name__)
+        log.info("bm25 build debut generation=%s fragments=%s", instantane.generation, len(instantane.metas))
         try:
             if instantane.signature != self._signature_disque():
                 # Devenu perime pendant l'attente du verrou : ne rien construire.
@@ -747,9 +784,16 @@ class Index:
             if instantane.signature != self._signature_disque():
                 return
             self._bm25 = _Bm25(instantane.signature, time.monotonic(), instantane.metas, bm25)
+            log.info("bm25 build fin generation=%s", instantane.generation)
         except Exception:  # noqa: BLE001 -- le lexical historique reste servi
-            logging.getLogger(__name__).exception("construction BM25 echouee")
+            log.exception("construction BM25 echouee")
         finally:
+            # `textes` (352k strings) + listes CSR intermediaires : liberation
+            # explicite, sinon retenus jusqu'au prochain cycle GC pendant que
+            # le publish suivant alloue deja ses 517 Mo.
+            with contextlib.suppress(NameError):
+                del textes
+            gc.collect()
             self._bm25_verrou.release()
 
     @staticmethod
@@ -872,6 +916,10 @@ class Index:
             )
 
             # 2. Lignes des AUTRES notes, conservees a l'identique.
+            # `np.asarray(mmap)[garde]` COPIE deja 517 Mo en anon, puis
+            # `concatenate` alloue une 2e fois. On libere explicitement les
+            # tampons intermediaires apres `sauvegarder` : sans `del`+`gc`,
+            # l'arene glibc retenait ~1 Go par publish (OOM 22/09/2026).
             garde = [i for i, meta in enumerate(anciens) if meta.chemin not in cibles]
             conserves = (
                 np.asarray(instantane.vecteurs)[garde]
@@ -896,7 +944,16 @@ class Index:
                         backlinks[cible].append(chemin)
 
             sauvegarder(self._repertoire, vecteurs, metas, backlinks)
-            self.invalider()
+            generation = _generation_courante(self._repertoire)
+            logging.getLogger(__name__).info(
+                "publish generation=%s fragments_avant=%s fragments_apres=%s",
+                generation, avant_fragments, len(metas),
+            )
+            # Rend les tampons intermediaires (2x517 Mo transitoires) sans
+            # attendre le GC cyclique : borne la dent de scie inter-publish.
+            del conserves, vecteurs_nouveaux, vecteurs, textes
+            gc.collect()
+            self.invalider(fermer=True)
 
         supprimees = sum(1 for contenu in changements.values() if contenu is None)
         return {

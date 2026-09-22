@@ -1,43 +1,52 @@
-﻿# progress — vault-mcp
+﻿# progress — Incident CRITICAL Vault MCP 22/09/2026
+STATE 13/13 | next: surveillance 48h + PR review | blocker: aucun (service E2E_HEALTHY, fix deploye)
 
-## Revue convia-analysis-surface (commit 45d54ad, parent 621ff22) — 2026-09-09
+## ROOT CAUSE
+- Cas B prouve : prod tournait f82a721 (hashes index.py 43c842b4 / embed.py df808619 / server.py 6b28579f identiques GitHub). Correctif e501135/c01b1b2 charge, mais OOM quand meme : 16:18:15 UTC oom-kill PID 2021670, pic 7.9G + 2.7G swap.
+- Mecanisme residuel (forensic A, ROOT_CAUSE_UNRESOLVED partiel) : H1 retention generations CONFIRMEE partiellement (deleted vectors.1790095681 528M via FD15 + anon 3.67G, `np.concatenate` 517M/publish dans `reindexer_chemins`), H2 builds BM25 co-facteur (`Instantane` ~350M epingle en thread daemon), H3 allocator (arenes 9x128M, THP 200M, HWM-RSS 850M non rendu), H4 ONNX amplificateur (threads=None cote service), H5 cache ecarte (653M disque, freelist 0), H6 sessions ecartee (16 threads/11 FD stables).
+- Fix deploys : `np.frombuffer.copy()` (embed.py), `_fermer_vecteurs` + `_courant` close opportuniste + `reindexer_chemins` del/gc/log + `_construire_bm25` log/del/gc (index.py).
 
-### Périmètre
-6 fichiers, +1614 / -91 (git diff 621ff22..45d54ad --stat).
-- Nouveau : vault_mcp/wiki_jobs.py (958 lignes) — file Wiki SQLite WAL : claim atomique lease_id+fencing_token+expiration, read confiné, submit idempotent validé+spoolé, release borné, merge_pending zéro-LLM, quarantaine, status.
-- Modifiés : vault_mcp/convia_mcp.py (+144/-63, wrappers wiki_* + ingest_status/status deprecated + ingest_start stub), vault_mcp/server.py (+113/-15, 5 outils MCP wiki_ingest_claim/read/submit/release/merge_pending + convia_scan/wiki_ingest_start redéfinis + DATA NOT INSTRUCTIONS sur read).
-- Tests : tests/test_wiki_jobs.py (437 lignes, 28 tests), tests/test_convia_mcp.py (27 lignes retouchées, ingest_start deprecated).
-- Hygiène : .claudeignore (11 lignes).
-Base : main. Prod SDK 2.2.0 MCPServer hors diff (greffe sur place, 66 passed annoncés dont import SDK PASS) — non revue ici.
+## FIXES
+- Code (branche fix/vault-memory-liveness-20260922) : embed.py frombuffer.copy ; index.py gc import, _fermer_vecteurs, _courant close si refcount<=3, invalider(fermer), reindexer_chemins del+gc+log generation, _construire_bm25 log debut/fin + del textes + gc. Deploys en prod /opt/vault-mcp + restart controle 17:59:40 UTC.
+- Systemd : 95-stabilisation-20260922.conf (VAULT_MCP_THREADS=2, MemorySwapMax=1G, High/Max 7G/8G inchanges) ; 40-seuil-dirty.conf (ReadWritePaths /srv/vault-spool/dirty pour vault-reindex, fix EROFS seuil). daemon-reload OK, threads/swap actifs apres restart.
+- Forensic auto : /opt/vault-watchdog/collect-forensic.sh (pre-restart/pre-deploy testes, rotation 10, /var/log/vault-mcp/forensic-*).
+- Healthcheck E2E : /opt/vault-watchdog/vault_e2e.py (EDGE_DOWN/AUTH_ALIVE/RUST_ALIVE/PYTHON_DOWN/INITIALIZE_FAILED/TOOLS_LIST_FAILED/E2E_HEALTHY, token via env file jamais argv). Prouve : E2E_HEALTHY tools=38.
+- Worker : pas de changement prod (ATTENTE 3h vs timeout 4h incoherent, fix EROFS seuil deploys, B-variante ATTENTE 1h30 + SIGTERM proposee en branche, a valider). Full 12h→6h propose, non applique.
+- Nginx : aucune modif (nginx -t vert avec sudo ; rouge sans sudo = snippet 0600 root, methode de test, pas regression). Warn 10.0.0.80:443 benin.
 
-### Blast radius
-- code-review-graph : build 43 fichiers / 697 noeuds / 5129 arêtes ; update --base main --brief : 13 fichiers changés, 161 fonctions/classes, 0 flux affecté, 98 test gaps, score risque 0.85.
-- impact --depth 2 sur wiki_jobs/convia_mcp/server : 0 noeud (requête --files en un seul token comma-join, inopérante ; nouveau module sans appelants historiques). Repli manuel grep+lecture intégrale wiki_jobs.py (958 lignes), convia_mcp.py:260-421, server.py:1170-1306, tests 437 lignes.
-- Graphe d'appels réel : wiki_jobs.claim/read_job/submit/release/merge_pending/status/sync_source/sync_directory/validate_extraction <- convia_mcp.wiki_claim/wiki_read/wiki_submit/wiki_release/wiki_merge_pending + ingest_status/ingest_start <- server.py wiki_ingest_claim/read/submit/release/merge_pending + wiki_ingest_status/start + convia_scan. Flux : unique tâche horaire ChatGPT claim->read->submit->merge_pending. convia_queue/projection/CAS hash non touchés. ingest_backlog (convia_mcp.py:337-356, appel INGEST_BIN --status) devient code mort (server.py convia_scan ne l'appelle plus) — conservé, inerte.
+## LIVE STATE
+- vault-mcp.service active (PID 1673454 depuis 17:59:40 UTC), Memory 55-61M, peak 61M, SwapMax 1G. vault-mcp-rs active (PID 1176126 depuis 18/09, 16.8M). nginx active. systemctl --failed : 0. Recv-Q :8787/:8788/:18987 = 0.
+- Index : 352565 fragments, vectors 517M courant, meta 140M, embed_cache 653M. Worker idle success (dernier publish 19.6s).
 
-### Risques
-- **Bloquant** — aucun (pas de perte de données silencieuse, pas de secret, pas d'écrasement silencieux, BEGIN IMMEDIATE partout, double-claim/double-merge testés).
-- **Majeur**
-  - Leases expirés non récupérables par claim -> starvation (wiki_jobs.py:328-335). claim ne sélectionne que status IN (pending,deferred) ; un job leased dont expires_at passe ne redevient pending que dans read_job (390-395) ou submit (671-677), jamais appelés sans lease valide par un tiers. Crash client entre claim et read = job coincé leased indéfiniment, invisible au status pending. Pas de reaper. Repro : claim lease 60s, abandon, attendre, claim -> leased=0 alors que le job existe. Fix : inclure (status=leased AND expires_at<now) dans claim OU tâche de réclamation.
-  - renew ressuscite un bail expiré sans contrôle (wiki_jobs.py:771-780). release(action=renew) ne vérifie jamais expires_at, prolonge de DEFAULT_LEASE_S (3600, pas le lease_seconds d'origine) jusqu'à MAX_RENEWS=3. Combiné au précédent : le détenteur expiré peut garder le job pendant que les autres attendent. Fix : refuser renew si expires_at<now (lease-expired, remettre pending).
-  - Extraction non bornée -> remplissage spool/disque via MCP (wiki_jobs.py:434-594, server.py:1250-1269). validate_extraction ne borne ni sections markdown (total), ni entities definition/name/aliases, ni relations type/evidence, et ne valide jamais doc[issues] (transmis tel quel lignes 718, 937). Aucune taille max sur extraction dict côté server. Un client mcp:ecriture peut spooler des enveloppes géantes (sanos limite) puis merge.py écrira des fiches géantes. Fix : borne (ex. extraction JSON <= 200 Ko, sections <= 50 Ko, entities <= 100, issues validé comme relations, evidence déjà tronquée à 200 OK ligne 537-538).
-- **Mineur**
-  - Idempotence avant authent du bail (wiki_jobs.py:659-668) : sur job submitted/merged, submit retourne duplicate/conflit SANS vérifier lease_id/fencing/expiry, et le lease n'est jamais effacé après submit (722-725). job_id déterministe sha(source_hash|chunk_hash|idx|contract)[:24] (197-199), recalculable. Impact faible (receipt déterministe, pas d'écrasement, read toujours protégé) mais viole le triple-check annoncé ligne 11. Fix : vérifier lease avant la branche idempotente.
-  - ValueError non mappée -> 500 au lieu d'erreur propre : convia_mcp.wiki_submit int(fencing_token) (convia_mcp.py:380-387), wiki_claim/merge passthrough server.py:1228-1230,1301 ; except ne prend que (ConviaError,OSError). Fix : attraper ValueError/TypeError -> ConviaError.
-  - Manifeste append dans la transaction sans atomicité fichier (wiki_jobs.py:917-933 : UPDATE merged, _manifest_append 926-932, COMMIT 933). Crash entre append et COMMIT -> doublon au retry (bénin last-wins, mais double ligne schema 4). _manifest_append (836-841) en append direct, pas tmp+rename -> ligne déchirée si ENOSPC/crash. Fix : COMMIT puis append avec dédup, ou append atomique + fsync dir déjà OK côté spool.
-  - _write_atomic_json tmp pid-only (607 : .tmp.{pid}) : 2 threads même process, même spool path, même pid -> écritures entrelacées. Sérialisé inter-process (pids distincts + os.replace), mais pas inter-thread. Faible (contenu idempotent identique). Fix : suffixe pid+threadid/uuid.
-  - sync_source boucle morte (242-244 for c in chunks: pass) + stale bump attempts même sur leased actif (247-255) cumulé avec submit stale (651-658) -> double incrément, quarantaine prématurée après 2-3 edits source. Nettoyer la boucle, ne pas incrémenter si déjà leased par le même cycle.
-  - Code mort privilégié conservé : _systemctl(privileged=True)+sudo (convia_mcp.py:273-291), INGEST_REQUEST (38-39), ingest_backlog (337-356) — plus appelés (ingest_start stub). Inertes, mais _systemctl show reste utilisé pour running best-effort (303-307). Ne pas réactiver sans revue sudoers/NoNewPrivileges.
-  - read_job reset expiré sans BEGIN IMMEDIATE (390-394) : 2 read concurrents sur même expiré font 2 UPDATE pending — bénin (les deux refusent le contenu). Pas de fuite.
-  - server.py passthrough négatifs : limit/max_ms négatifs (truthy) -> merge_pending limit<0 rend 0 immédiatement (bénin) ; claim négatifs clampés côté wiki_jobs (321-322). OK.
-  - Sécurité MCP vérifiée : read confiné DB uniquement (jamais de open(path) sur entrée appelant), claim clampé (<=10, 60-86400s), write tools sous _exiger_ecriture sauf wiki_ingest_read (lecture seule, voulu), DATA NOT INSTRUCTIONS sur read (server.py:1236-1241) + data_notice (wiki_jobs.py:411-413). Aucun secret dans le diff. Aucune régression ConvIA (queue/projection/CAS hash intacts). Écart prod SDKv2 non aggravé (nouveaux outils même pattern @mcp.tool, aucune API FastMCP-spécifique).
-  - Tests manquants : reclaim expiré, renew expiré, submit sans lease après submitted, payload géant/issues, doublon manifeste après crash, fencing non-numérique.
+## MEMORY BEFORE/AFTER
+- BEFORE : OOM 7.9G peak + 2.7G swap (16:18), process 4.55G stable (RSS 4304796 kB = anon 3727464 + file 577k, Private_Dirty=anon, deleted mmap 528M, heap 48M, threads 16, FD 11).
+- AFTER : 55.8M au boot → 61M apres 20 recherches + E2E (stable, pas de dent). Soak 200 recherches + 2 publishes naturels restant a observer sur 48h via forensic+e2e (instrumentation en place).
 
-### Tests à lancer
-- Ciblé (vérifié 2026-09-09 : collect 28+25, run OK 1 skipped) : python -m pytest tests/test_wiki_jobs.py tests/test_convia_mcp.py -q
-- Complet (66 passed annoncés) : python -m pytest -q
-- Fuzz manuel avant GO : claim abandonné puis reclaim ; renew après expiry ; submit submitted sans lease ; submit 5 Mo/issues imbriqués ; kill -9 entre manifest append et COMMIT puis merge_pending x2 (compter lignes manifest) ; fencing_token=abc.
-- Test gaps outil : 98 (env, interdit, _tool, build_fixture, wj) — couvrir au moins les 6 ci-dessus.
+## HEALTHCHECK
+- Topologie prouvee : nginx :8788 (127.0.0.1 + 10.200.114.203) → Rust 127.0.0.1:18987 → Python 127.0.0.1:8787. Public :443 /vault/mcp → :18987, well-known/authorize/token → :8787.
+- Sans auth : Rust 401 0.6ms, Python 401 1.2ms, edge 401 0.9ms, public 401 6.2ms = EDGE_AUTH_ALIVE (jamais E2E_HEALTHY). Rust /health 200, Python well-known 200.
+- E2E authentifie : initialize 200 10ms + tools/list 200 10-20ms, tools=38 → E2E_HEALTHY (interne :18987 et :8787).
 
-### Verdict
-À corriger : 3 majeurs cernés (reclaim expiré, renew sans check expiry, extraction non bornée) + 2 mineurs faciles (lease avant idempotence, ValueError->ConviaError). Pas de refonte, pas de régression ConvIA, concurrence saine (BEGIN IMMEDIATE + tests 2-threads verts). GO après ces 5 fixes + 6 tests.
+## INDEX WORKER
+- activating 4h explique : Type=oneshot + TimeoutStartSec=4h, kill a 4h00 pile x3 (21/09 00:18, 22/09 08:18, reconciliation 11:20→15:20). Publish = rewrite complete 541M+145M pour 1 note (20s cache chaud → 4h cache froid), ATTENTE 3h + publish >1h = kill mid-publish (5 meta.tmp 0 octets, inflight recupere, zero perte). Contention sqlite + EROFS seuil (ReadOnlyPaths, seuil fige 15/09 → 5084 ecarts, `laisse au full` toutes les 10 min). Actuellement nominal (runs 18-45s success).
+
+## NGINX
+- `sudo nginx -t` vert (syntax ok, test successful, seul warn netbird:31). Sans sudo : emerg snippet 0600 root (excalidraw-biblio-auth.conf, mtime 16/09 inchange) → divergence methode, pas regression. Aucun reload effectue (non necessaire). Rollback N/A.
+
+## TESTS
+- Staging isole /tmp/vault-staging (PYTHONPATH src, VAULT_MCP_INDEX/EMBED_CACHE tmp, sudo -u juliann-app) : test_memory_bounds 4 passed (mmap close, courant, invalider, cache copy) ; test_index+test_embed+test_index_incremental 45 passed. Windows local : py_compile OK, ruff (restes pre-existants S608/N818 + 0 nouveau apres fix).
+- E2E live : initialize + tools/list 200, 38 outils, latences <30ms. 20 recherches read-only OK (mode degrade session, a rejouer en soak propre).
+
+## GIT SHA / PR
+- Base : origin/main f82a721 (Merge PR #4 prod-sync-20260921). Correctifs : e501135 (publish/BM25) + c01b1b2 (embed threads). Local : prod-sync-20260921 a205246 (= f82a721 + docs revue, 1 commit). Branche : fix/vault-memory-liveness-20260922 (code + systemd versionnes + scripts + tests). Prod /opt/vault-mcp non versionne mais hashes == f82a721 avant deploy, + nos 2 fichiers apres (backups /root/vault-mcp-rollback-20260922T175627Z). PR non creee (push https sans token en session ; a pousser + PR vers main, CI attendue).
+
+## ROLLBACK
+- Systemd : /root/vault-mcp-rollback-20260922T175627Z/{vault-mcp.service.d,vault-reindex.service.d,vault-index-worker.service.d} + index.py/embed.py. Restaurer : sudo cp -a backup → /etc/systemd/system/... + /opt/vault-mcp/vault_mcp/..., daemon-reload, restart vault-mcp, verifier E2E_HEALTHY. Forensic/watchdog : supprimer /opt/vault-watchdog + drop-ins 95/40. Nginx : aucun changement → aucun rollback. DB/index : jamais touches (pas de reindex, pas de purge cache).
+
+## OPEN RISKS
+- Attribution exacte 3.67G anon (copies vs BM25 vs fragmentation) exige tracemalloc/py-spy en staging charge (publishes 10min + 5 req/min + BM25 fond) ; instrumentation pre-restart en place pour le prochain incident.
+- Worker : kill 4h encore possible avant ATTENTE 1h30 + SIGTERM + full 6h (proposes, non deploys) ; notify-failure bruyant ; MemoryMax worker 3G vs pic 2.2G marge fine.
+- EROFS seuil corrige (drop-in) mais seuil non repose avant prochain full 03:30 → reconciliation decorative jusque-la.
+- Soak 48h (RSS<800M, 0 OOM, readyz p99<2s) non encore observe ; swap borne 1G a valider au prochain pic.
+- meta.tmp 0-octets (5) non purges (glob sudo a fiabiliser) ; inoffensifs.
+- Docs architecture (notes/infra/VPS-Etude-etat-reel.md) a MAJ via canal Vault (topologie nginx→rs→python + 401 vs E2E + backlog + forensic + rollback + MemoryMax/OOM + worker + nginx sudo).
