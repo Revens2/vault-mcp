@@ -25,8 +25,11 @@ for f in vault_mcp/embed.py vault_mcp/index.py vault_mcp/server.py; do
   else echo "FICHIER-KO $f tarball=$a deploye=$b"; EC=1; fi
 done
 
-EXCLUS=(--exclude=index/ --exclude=models/ --exclude=oauth/ --exclude=venv/
-        --exclude=bin/ --exclude=__pycache__/ --exclude=*.env --exclude=*.bak* --exclude=*.tmp
+# NOTE: pas de slash final sur les motifs de repertoires — `diff --exclude`
+# ne les exclut pas avec (teste : --exclude=index/ ne mord pas).
+EXCLUS=(--exclude=index --exclude=models --exclude=oauth --exclude=venv
+        --exclude=bin --exclude=backups --exclude=.cache
+        --exclude=__pycache__ --exclude=*.env --exclude=*.bak* --exclude=*.tmp
         --exclude=*.log --exclude=plan.md --exclude=errors.md)
 if diff -r -q "${EXCLUS[@]}" "$VERIF/vault-mcp/" /opt/vault-mcp/ > /tmp/vault-mcp-verify-diff.txt 2>&1; then
   echo "DIFF-VIDE-OK"

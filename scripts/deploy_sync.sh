@@ -28,10 +28,12 @@ tar -xzf "$TARBALL" -C "$STAGING"
 SRC="$STAGING/vault-mcp"
 [ -d "$SRC/vault_mcp" ] || { echo "ERREUR: arborescence inattendue dans $TARBALL" >&2; exit 2; }
 
-EXCLUS=(index/ models/ oauth/ venv/ bin/ __pycache__/ .git/
+EXCLUS=(index/ models/ oauth/ venv/ bin/ backups/ .cache/
+        __pycache__/ .git/
         '*.env' '*.bak*' '*.tmp' '*.log' 'plan.md' 'errors.md')
 # NOTE: bin/ exclu — contient le binaire ngrok du tunnel (vault-ngrok.service),
-# gere hors git. Ne jamais le supprimer via --delete.
+# gere hors git. backups/ (vieux backups manuels) et .cache/ (caches d'outillage)
+# sont hors perimetre : le backup pre-apply (/opt/vault-mcp-backup-<ts>) les preserve.
 FILTRE=(); for e in "${EXCLUS[@]}"; do FILTRE+=(--exclude="$e"); done
 
 echo "== diff staging -> /opt/vault-mcp (hors runtime) =="
