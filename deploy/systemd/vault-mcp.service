@@ -1,0 +1,54 @@
+[Unit]
+Description=Vault RAG MCP (streamable-http) -- compte dedie, isole
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=juliann-app
+Group=juliann-app
+WorkingDirectory=/opt/vault-mcp
+EnvironmentFile=/opt/vault-mcp/mcp.env
+ExecStart=/opt/vault-mcp/venv/bin/python -m vault_mcp.server
+Restart=always
+RestartSec=3
+
+# --- Isolation ---
+# Ce service est le seul composant applicatif joignable depuis internet.
+# En cas d execution de code arbitraire, tout ci-dessous limite les degats.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RemoveIPC=yes
+# Aucune capacite : le service ecoute sur 8787, port non privilegie.
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Reseau : IPv4/IPv6/unix uniquement, pas de sockets brutes.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+# N ecoute que sur la boucle locale ; nginx (8788) est le seul point d entree.
+# Le DNAT Docker reecrit la destination avant le filtre BPF : il faut donc
+# autoriser le sous-reseau du bridge de CouchDB (juliann-sync_default), pas
+# seulement l IP Tailscale publiee.
+IPAddressAllow=localhost 10.200.114.203 172.18.0.0/16
+IPAddressDeny=any
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+# L index est le seul chemin que le service doit pouvoir ecrire.
+ReadWritePaths=/opt/vault-mcp/index /opt/vault-mcp/oauth
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
