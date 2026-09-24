@@ -251,7 +251,10 @@ def _bridge_call(prompt: str, title: str) -> str:
     tmp = AGY_BRIDGE_DIR / f"{ident}.req.depot"
     try:
         tmp.write_text(prompt, encoding="utf-8")
-        os.chmod(tmp, 0o660)
+        # 0660 EXPLICITE : le lecteur (agy-bridge.service, compte convia) n'est
+        # pas l'ecrivain (juliann-app) ; les deux partagent le groupe agybridge
+        # (repertoire en 2770). Un 0600 casserait le pont (timeout CALL_TIMEOUT_S+180s).
+        os.chmod(tmp, 0o660)  # nosemgrep: insecure-file-permissions
         tmp.rename(req)  # publication atomique : jamais de consigne tronquee
     except OSError as exc:
         raise ProviderError("agy", f"pont indisponible : {exc.strerror}") from exc

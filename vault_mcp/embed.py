@@ -94,13 +94,13 @@ def _lire_cache(cles: list[str]) -> dict[str, NDArray[np.float32]]:
     conn = _cache()
     for debut in range(0, len(cles), 900):  # limite de variables liees de SQLite
         lot = cles[debut : debut + 900]
-        marques = ",".join("?" * len(lot))
-        for cle, blob in conn.execute(
+        marques = ",".join("?" * len(lot))  # que des placeholders : pas d'injection
+        for cle, blob in conn.execute(  # nosemgrep: sqlalchemy-execute-raw-query
                 f"SELECT cle, vecteur FROM vecteurs WHERE cle IN ({marques})", lot):
             trouves[cle] = np.frombuffer(blob, dtype=np.float32)
         # `vu_le` marque ce qui sert encore : sans cela la purge jetterait les
         # fragments les plus stables, precisement ceux que le cache doit garder.
-        conn.execute(f"UPDATE vecteurs SET vu_le=? WHERE cle IN ({marques})",
+        conn.execute(f"UPDATE vecteurs SET vu_le=? WHERE cle IN ({marques})",  # nosemgrep: sqlalchemy-execute-raw-query
                      [int(time.time()), *lot])
     conn.commit()
     return trouves
