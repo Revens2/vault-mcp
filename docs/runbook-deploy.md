@@ -59,7 +59,8 @@ seraient perdus : exclusions impératives, jamais purger le cache).
   vs `e03ce3c2` — fixes live post-22/09 jamais reversionnés ; ~30 fichiers diffèrent
   (contenu ou perms/owner).
 - Premier `--apply` SUPPRIMERAIT (à valider explicitement avant) : `backups/`
-  (sauvegardes pré-merge 13/09), `src/`, `bin/ngrok` — absents de `main`, usage
-  inconnu. Ne pas appliquer sans statuer sur ces 3 chemins.
+  (sauvegardes pré-merge 13/09), `src/` (copie root Sept 8, sans référence) —
+  absents de `main`. `bin/` (binaire ngrok du tunnel `vault-ngrok.service`, en
+  cours d'exécution) est EXCLU du rsync : ne jamais le supprimer.
 - Observé, hors passe : `vault-mcp-healthcheck.service` en `failed`,
   port :8788 absent, `PORT-OK :8787`, unit active.
