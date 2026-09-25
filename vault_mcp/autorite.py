@@ -7,7 +7,7 @@ l'index pour chaque fragment :
 
   0  notes/, Architecture/, fichiers racine  -- etat courant, fiches verifiees
   1  wiki/entities, wiki/concepts            -- memoire durable synthetisee
-  2  wiki/sources                            -- enrichissement
+  2  wiki/sources, journaux (JOURNAUX)       -- enrichissement, trace datee
   3  raw/assets/ConvIA-Analysis              -- analyse d'episode
   4  raw/ (dont ConvIA brut)                 -- episode, historique
 """
@@ -24,7 +24,16 @@ _HISTORIQUE = re.compile(
 )
 
 
+# Journaux dates : sous notes/ mais ce sont des traces d'activite, pas des fiches
+# d'etat. Au rang 0 ils occupaient le top devant la fiche canonique (audit
+# 2026-09-25 : n04, n20, b44). Une requete historique desactive tout le prior
+# (cf. `historique`), donc ils restent trouvables quand on les cherche.
+JOURNAUX = ("notes/activity/daily/", "notes/planning/reconciliation/")
+
+
 def rang_autorite(chemin: str) -> int:
+    if chemin.startswith(JOURNAUX):
+        return 2
     if chemin.startswith("raw/assets/ConvIA-Analysis/"):
         return 3
     if chemin.startswith("raw/"):
@@ -41,4 +50,4 @@ def historique(requete: str) -> bool:
     return bool(_HISTORIQUE.search(requete))
 
 
-__all__ = ["historique", "rang_autorite"]
+__all__ = ["JOURNAUX", "historique", "rang_autorite"]
