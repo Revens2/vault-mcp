@@ -9,6 +9,7 @@ et un `reindex.py --check` qui ne converge jamais.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
 VAULT_DEFAUT = Path("/srv/vault-mirror")
@@ -36,6 +37,13 @@ EXCLUS = (
 # taille leur donne un poids sans rapport avec leur valeur (index.md = 152 fragments).
 FICHIERS_EXCLUS = ("index.md", "log.md")
 
+# Transcripts produits par les evaluations RAG elles-memes (bancs e2e qui posent
+# une question golden a un modele avec un CONTEXTE injecte), re-exportes par ConvIA.
+# 267 notes au 2026-09-25, souvent en 4-8 copies quasi identiques : elles
+# remontaient en tete (audit 2026-09-25, n23) et contaminaient les etiquettes.
+# Seul le nom est teste : `indexable` ne voit que le chemin.
+EVAL_RAG = re.compile(r"^raw/assets/ConvIA/[^/]+/\d{4}-\d{2}-\d{2}_(?:rag-v2-answer-eval|question)-")
+
 
 def repertoire_vault() -> Path:
     return Path(os.environ.get("VAULT_MCP_VAULT", str(VAULT_DEFAUT)))
@@ -56,6 +64,7 @@ def indexable(relatif: str) -> bool:
         or relatif.startswith(EXCLUS)
         or nom.startswith("livesync_log_")
         or relatif in FICHIERS_EXCLUS
+        or EVAL_RAG.match(relatif) is not None
     )
 
 
@@ -68,6 +77,7 @@ def notes(racine: Path) -> list[Path]:
 
 
 __all__ = [
+    "EVAL_RAG",
     "EXCLUS",
     "FICHIERS_EXCLUS",
     "VAULT_DEFAUT",
