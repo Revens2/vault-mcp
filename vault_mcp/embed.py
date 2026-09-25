@@ -97,7 +97,10 @@ def _lire_cache(cles: list[str]) -> dict[str, NDArray[np.float32]]:
         marques = ",".join("?" * len(lot))  # que des placeholders : pas d'injection
         for cle, blob in conn.execute(  # nosemgrep: sqlalchemy-execute-raw-query
                 f"SELECT cle, vecteur FROM vecteurs WHERE cle IN ({marques})", lot):
-            trouves[cle] = np.frombuffer(blob, dtype=np.float32)
+            # `.copy()` : sans lui, le ndarray retient une vue sur le `bytes`
+            # sqlite, qui retient a son tour tout le lot lu. Sur 352k fragments,
+            # cela epinglait des centaines de Mo en anon apres chaque publish.
+            trouves[cle] = np.frombuffer(blob, dtype=np.float32).copy()
         # `vu_le` marque ce qui sert encore : sans cela la purge jetterait les
         # fragments les plus stables, precisement ceux que le cache doit garder.
         conn.execute(f"UPDATE vecteurs SET vu_le=? WHERE cle IN ({marques})",  # nosemgrep: sqlalchemy-execute-raw-query
