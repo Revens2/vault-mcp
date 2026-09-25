@@ -288,8 +288,8 @@ def search_notes(query: str, limit: int = 50) -> list[dict[str, str]]:
 
 
 @mcp.tool()
-def search_vault(query: str, limit: int = 10, mode: str = "hybride") -> list[dict[str, object]]:
-    """Recherche semantique dans le vault.
+def search_vault(query: str, limit: int = 5, mode: str = "hybride") -> list[dict[str, object]]:
+    """Recherche semantique dans le vault (5 notes par defaut ; limit=10 pour elargir).
 
     mode : "hybride" (defaut, fusion par rang reciproque), "vecteur" (sens seul),
     "lexical" (mots-cles seuls, utile pour un identifiant exact type ORA-01555).
