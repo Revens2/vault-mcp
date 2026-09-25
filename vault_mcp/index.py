@@ -377,6 +377,37 @@ BM25_INTERVALLE_S = float(os.environ.get("VAULT_MCP_BM25_INTERVALLE_S", "900"))
 BM25_SYNCHRONE_MAX = 5000
 
 
+POOL_MIN = int(os.environ.get("VAULT_MCP_POOL_MIN", "150"))
+
+# Suffixe hash des exports ConvIA (`_8fbb0de7.md`) : meme conversation re-exportee,
+# ou meme question rejouee, sous des noms qui ne different que par lui.
+_SUFFIXE_HASH = re.compile(r"[_-][0-9a-f]{8}\.md$")
+
+
+def cle_quasi_doublon(chemin: str) -> str:
+    return _SUFFIXE_HASH.sub("", chemin.rsplit("/", 1)[-1]).lower()
+
+
+def sans_quasi_doublons(classes: Sequence[tuple[str, float]], limit: int) -> list[tuple[str, float]]:
+    """Garde le premier de chaque famille de transcripts `raw/` quasi identiques.
+
+    Audit 2026-09-25 : 4 copies de la meme conversation occupaient 4 places du top.
+    Seul `raw/` est concerne ; une note hors raw/ n'est jamais ecartee mais marque
+    sa cle (un transcript homonyme d'une fiche passe donc apres elle).
+    """
+    sortie: list[tuple[str, float]] = []
+    vues: set[str] = set()
+    for chemin, score in classes:
+        cle = cle_quasi_doublon(chemin)
+        if chemin.startswith("raw/") and cle in vues:
+            continue
+        vues.add(cle)
+        sortie.append((chemin, score))
+        if len(sortie) >= limit:
+            break
+    return sortie
+
+
 def poids_autorite() -> float:
     """Poids du prior d'autorite dans la fusion (0 = desactive). Voir `autorite.py`."""
     return float(os.environ.get("VAULT_MCP_POIDS_AUTORITE", "2.0"))
@@ -632,7 +663,9 @@ class Index:
         docs/eval-retrieval.md. Retombe sur l'ancien lexical tant que le BM25 n'est pas pret.
         """
         instantane = self._courant()
-        pool = max(limit * 5, 20)
+        # Pool plancher : le dedoublonnage ecarte des candidats, et un top 5 avec un
+        # pool de 25 perdait des notes que le pool de 150 retrouvait (audit 2026-09-25).
+        pool = max(limit * 5, POOL_MIN)
         # Voie fraiche (vault_mcp.frais) : notes du miroir que l'index publie ne
         # reflete pas encore -- ConvIA arrivees par rclone, lots en attente d'embedding.
         frais = _frais(requete, pool)
@@ -684,7 +717,7 @@ class Index:
         if poids and not historique(requete):
             for chemin in cumul:
                 cumul[chemin] += poids * (4 - rang_autorite(chemin)) / 4 / 61
-        ordonnes = sorted(cumul.items(), key=lambda kv: -kv[1])[:limit]
+        ordonnes = sans_quasi_doublons(sorted(cumul.items(), key=lambda kv: -kv[1]), limit)
         sortie: list[Resultat] = []
         for chemin, score in ordonnes:
             if chemin in recents:
@@ -1015,7 +1048,9 @@ __all__ = [
     "Resultat",
     "VerrouOccupe",
     "extraire_wikilinks",
+    "cle_quasi_doublon",
     "fusion_rang_reciproque",
+    "sans_quasi_doublons",
     "repertoire_index",
     "sauvegarder",
     "verrou_writers",
