@@ -1,0 +1,11 @@
+[Unit]
+Description=Vault MCP healthcheck toutes les 60 secondes (sonde + watchdog anti-flap)
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=60s
+AccuracySec=10s
+Unit=vault-mcp-healthcheck.service
+
+[Install]
+WantedBy=timers.target

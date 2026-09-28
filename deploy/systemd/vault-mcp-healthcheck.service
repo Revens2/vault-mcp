@@ -1,0 +1,15 @@
+[Unit]
+Description=Vault MCP healthcheck sonde applicative (oneshot, 60s via timer)
+After=vault-mcp.service
+Documentation=https://localhost/
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+ExecStartPre=/bin/mkdir -p /var/lib/vault-mcp-healthcheck
+ExecStart=/usr/local/bin/vault-mcp-healthcheck.sh
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=yes
