@@ -43,8 +43,11 @@ fixes) reste lisible : la bascule se fait a la premiere publication du nouveau c
 from __future__ import annotations
 
 import contextlib
+import ctypes
+import ctypes.util
 import errno
 import fcntl
+import gc
 import json
 import logging
 import os
@@ -417,8 +420,34 @@ def poids_autorite() -> float:
 class _Bm25:
     generation: int
     construit_a: float
-    metas: list[MetaFragment]
+    # (chemin, rang) par ligne BM25 : ne retient pas les MetaFragment (apercu,
+    # titre) de la generation du build, qui survit jusqu'a 15 min a la suivante.
+    lieux: list[tuple[str, int]]
     index: IndexBM25
+
+
+def _charger_libc() -> ctypes.CDLL | None:
+    try:
+        nom = ctypes.util.find_library("c")
+        libc = ctypes.CDLL(nom) if nom else None
+    except OSError:
+        return None
+    return libc if libc is not None and hasattr(libc, "malloc_trim") else None
+
+
+_LIBC = _charger_libc()
+
+
+def liberer_memoire() -> None:
+    """Rend a l'OS la memoire liberee apres un rechargement ou un build BM25.
+
+    Sans cela, glibc garde les pages des centaines de milliers de petits objets
+    d'une ancienne generation dans ses arenas : le RSS monte d'un palier a chaque
+    publication et ne redescend jamais (figement sous MemoryHigh, 27-28/09/2026).
+    """
+    gc.collect()
+    if _LIBC is not None:
+        _LIBC.malloc_trim(0)
 
 
 def textes_complets(metas: Sequence[MetaFragment], racine: Path) -> list[str]:
@@ -458,6 +487,9 @@ class Index:
         self._instantane: Instantane | None = None
         self._bm25: _Bm25 | None = None
         self._bm25_verrou = threading.Lock()
+        # Single-flight : apres une publication, un seul thread relit meta.json
+        # (161 Mo) ; les autres attendent et reprennent son instantane.
+        self._charge_verrou = threading.Lock()
 
     @property
     def repertoire(self) -> Path:
@@ -520,6 +552,7 @@ class Index:
                     else {}
                 )
             metas = [MetaFragment(**m) for m in brut]
+            del document, brut
             if vecteurs.shape[0] == len(metas):
                 return Instantane(
                     signature=signature,
@@ -545,9 +578,19 @@ class Index:
                 metas=[],
                 backlinks={},
             )
-        if self._instantane is None or actuelle != self._instantane.signature:
-            self._instantane = self._charger()
-        return self._instantane
+        courant = self._instantane
+        if courant is not None and actuelle == courant.signature:
+            return courant
+        with self._charge_verrou:
+            courant = self._instantane
+            if courant is None or self._signature_disque() != courant.signature:
+                # Lacher l'ancienne generation AVANT de charger la nouvelle :
+                # sinon deux copies de meta.json coexistent au pic.
+                self._instantane = None
+                del courant
+                self._instantane = self._charger()
+                liberer_memoire()
+            return self._instantane
 
     def invalider(self) -> None:
         """Force la relecture au prochain acces (a appeler apres avoir pris le verrou)."""
@@ -779,11 +822,14 @@ class Index:
             )
             if instantane.signature != self._signature_disque():
                 return
-            self._bm25 = _Bm25(instantane.signature, time.monotonic(), instantane.metas, bm25)
+            lieux = [(m.chemin, m.rang) for m in instantane.metas]
+            del textes
+            self._bm25 = _Bm25(instantane.signature, time.monotonic(), lieux, bm25)
         except Exception:  # noqa: BLE001 -- le lexical historique reste servi
             logging.getLogger(__name__).exception("construction BM25 echouee")
         finally:
             self._bm25_verrou.release()
+            liberer_memoire()
 
     @staticmethod
     def _classement_bm25(
@@ -793,13 +839,12 @@ class Index:
         touches = np.nonzero(scores)[0]
         meilleur: dict[str, tuple[float, int]] = {}
         for i in touches[np.argsort(-scores[touches], kind="stable")]:
-            chemin = bm25.metas[int(i)].chemin
+            chemin, rang = bm25.lieux[int(i)]
             if chemin in meilleur:
                 continue
             lignes = instantane.fragments_par_note.get(chemin)
             if lignes is None or not indexable(chemin):
                 continue
-            rang = bm25.metas[int(i)].rang
             ligne = next((j for j in lignes if instantane.metas[j].rang == rang), lignes[0])
             meilleur[chemin] = (float(scores[i]), ligne)
             if len(meilleur) >= limit:
