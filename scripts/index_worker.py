@@ -27,6 +27,9 @@ redeclencherait en boucle pendant les deux heures du full.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import errno
+import fcntl
 import os
 import sys
 import time
@@ -48,6 +51,76 @@ RECONCILIATION_MAXIMUM = int(os.environ.get("VAULT_MCP_RECONCILIATION_MAX", "200
 # mesure) : le worker fait la queue derriere lui plutot que de rendre la main a un
 # `.path` unit qui le redeclencherait aussitot.
 ATTENTE_VERROU_S = float(os.environ.get("VAULT_MCP_ATTENTE_VERROU_S", "10800"))
+
+# Verrou du miroir, pris EXCLUSIF par vault_mirror_sync.sh pendant `rclone sync`.
+# Pendant un sync, un fichier modifie est deplace en --backup-dir puis
+# retelecharge : absent quelques minutes. Un lot lu a ce moment le retirait de
+# l'index a tort (oscillation 352k <-> 388k fragments, 28/09/2026). Les workers
+# le prennent PARTAGE pendant leurs lectures du miroir -- et seulement une fois
+# le verrou writer obtenu : l'attendre avant bloquerait le sync pendant un full.
+VERROU_MIROIR = os.environ.get("VAULT_MIRROR_LOCK", "/run/lock/vault-mirror.lock")
+ATTENTE_MIROIR_S = float(os.environ.get("VAULT_MIRROR_LOCK_WAIT_S", "3600"))
+
+
+class MiroirOccupe(RuntimeError):
+    """Le sync du miroir n'a pas rendu la main dans le delai."""
+
+
+class VerrouMiroir:
+    """Verrou PARTAGE du miroir, pris a la demande, relache par `lacher()`.
+
+    Ouvert en lecture seule sans O_CREAT : le fichier appartient a l'utilisateur
+    du sync et `fs.protected_regular` refuse O_CREAT dans /run/lock. Fichier
+    absent (tmpfiles non passe) : on continue sans verrou plutot que de bloquer.
+    """
+
+    def __init__(self, chemin: str = VERROU_MIROIR, attente_s: float = ATTENTE_MIROIR_S) -> None:
+        self._chemin = chemin
+        self._attente_s = attente_s
+        self._fd: int | None = None
+        self._tente = False
+
+    def prendre(self) -> None:
+        if self._tente:
+            return
+        self._tente = True
+        try:
+            fd = os.open(self._chemin, os.O_RDONLY)
+        except FileNotFoundError:
+            journal(f"verrou miroir absent ({self._chemin}), lecture sans verrou")
+            return
+        limite = time.monotonic() + self._attente_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                self._fd = fd
+                return
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                    os.close(fd)
+                    raise
+                if time.monotonic() >= limite:
+                    os.close(fd)
+                    raise MiroirOccupe(
+                        f"sync du miroir toujours en cours apres {self._attente_s:.0f}s"
+                    ) from None
+                time.sleep(1.0)
+
+    def lacher(self) -> None:
+        if self._fd is not None:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+            os.close(self._fd)
+            self._fd = None
+        self._tente = False
+
+
+@contextlib.contextmanager
+def miroir_verrouille(verrou: VerrouMiroir):
+    verrou.prendre()
+    try:
+        yield
+    finally:
+        verrou.lacher()
 
 
 def journal(*message: object) -> None:
@@ -167,8 +240,9 @@ def main() -> int:
             journal(f"seuil dans le futur ({seuil} > {debut_parcours}), desarme")
             seuil = 0
         try:
-            ecarts = ecarts_miroir(index, seuil)
-        except OSError as exc:
+            with miroir_verrouille(VerrouMiroir()):
+                ecarts = ecarts_miroir(index, seuil)
+        except (OSError, MiroirOccupe) as exc:
             journal(f"reconciliation impossible : {exc}")
             ecarts = None
         if ecarts is None:
@@ -199,12 +273,19 @@ def main() -> int:
     journal(f"lot {jeton} : {len(reclames)} chemin(s), {restants} encore en file")
 
     debut = time.time()
+    verrou_miroir = VerrouMiroir()
+
+    def lecteur(chemin: str) -> str | None | object:
+        # Premiere lecture = verrou writer deja tenu : on prend alors le miroir.
+        verrou_miroir.prendre()
+        return lecteur_miroir(chemin)
+
     try:
         # On ATTEND le verrou au lieu de rendre la main : sans cela, le `.path`
         # unit redeclencherait le worker en boucle pendant les 2 h du full.
         # L'attente est sans risque puisque les contenus sont lus SOUS verrou.
         resultat = index.reindexer_chemins(
-            sorted(reclames), lecteur_miroir, attente_verrou_s=ATTENTE_VERROU_S
+            sorted(reclames), lecteur, attente_verrou_s=ATTENTE_VERROU_S
         )
     except VerrouOccupe:
         rendus = dirty.rendre(jeton)
@@ -217,6 +298,8 @@ def main() -> int:
         rendus = dirty.rendre(jeton)
         journal(f"echec {type(exc).__name__}: {exc} -- {rendus} chemin(s) laisses en file")
         return 1
+    finally:
+        verrou_miroir.lacher()
 
     dirty.acquitter(jeton)
     ignores = resultat.get("ignores") or []
