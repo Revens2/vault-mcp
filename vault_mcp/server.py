@@ -18,7 +18,7 @@ import time
 
 import uvicorn
 from mcp.server.auth.middleware.auth_context import get_access_token
-from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import AnyHttpUrl
@@ -148,6 +148,11 @@ mcp = MCPServer(
             valid_scopes=PORTEES,
             default_scopes=[PORTEE],
         ),
+        # Revocation RFC 7009 (issue #11) : sans elle, un client n a aucun moyen de
+        # retirer son jeton, et une fuite reste exploitable jusqu a expiration.
+        # Annoncee dans les metadonnees (`revocation_endpoint`) ; authentifiee par
+        # client, un client ne revoque que SES jetons (garde du SDK).
+        revocation_options=RevocationOptions(enabled=True),
     ),
 )
 
