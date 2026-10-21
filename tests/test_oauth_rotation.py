@@ -3,7 +3,7 @@
 Contrat verifie :
 - rotation stricte : un refresh ne s'echange qu'une fois ;
 - rejeu d'un refresh consomme (hors grace) -> famille entiere revoquee (acces compris) ;
-- grace configurable : rejeu tolere dans la fenetre, puis detection ;
+- grace configurable (defaut 60 s) : rejeu tolere dans la fenetre, puis detection ;
 - duree glissante bornee par une duree absolue de famille ;
 - jetons herites (sans famille, ou 10 ans) : toujours acceptes, ramenes a la borne ;
 - revocation RFC 7009 via /revoke, et revocation administrative par client ;
@@ -40,6 +40,12 @@ def _env_propre(monkeypatch: pytest.MonkeyPatch) -> None:
         "VAULT_MCP_OAUTH_REFRESH_REUSE_GRACE_S",
     ):
         monkeypatch.delenv(nom, raising=False)
+
+
+@pytest.fixture
+def strict(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rotation stricte (grace 0) : tout rejeu immediat est une detection."""
+    monkeypatch.setenv("VAULT_MCP_OAUTH_REFRESH_REUSE_GRACE_S", "0")
 
 
 def _client(client_id: str = "client-a") -> OAuthClientInformationFull:
@@ -80,7 +86,7 @@ async def test_rotation_stricte_le_refresh_ne_sert_qu_une_fois(fournisseur):
     assert fournisseur.magasin.lire_rafraichissement(second.refresh_token) is not None
 
 
-async def test_rejeu_revoque_toute_la_famille(fournisseur, caplog):
+async def test_rejeu_revoque_toute_la_famille(fournisseur, strict, caplog):
     premier = fournisseur._emettre("client-a", ["mcp:lecture"], None)
     second = await _rafraichir(fournisseur, premier.refresh_token)
     # L'attaquant (ou le client legitime) rejoue l'ancien refresh.
@@ -96,7 +102,7 @@ async def test_rejeu_revoque_toute_la_famille(fournisseur, caplog):
         assert jeton not in caplog.text
 
 
-async def test_rejeu_ne_touche_pas_les_autres_familles(fournisseur):
+async def test_rejeu_ne_touche_pas_les_autres_familles(fournisseur, strict):
     a = fournisseur._emettre("client-a", ["mcp:lecture"], None)
     autre = fournisseur._emettre("client-a", ["mcp:lecture"], None)
     await _rafraichir(fournisseur, a.refresh_token)
@@ -112,7 +118,7 @@ async def test_un_autre_client_ne_peut_pas_faire_tomber_une_famille(fournisseur)
     assert fournisseur.magasin.lire_rafraichissement(second.refresh_token) is not None
 
 
-async def test_echange_concurrent_du_meme_refresh_ne_produit_qu_une_paire(fournisseur):
+async def test_echange_concurrent_du_meme_refresh_ne_produit_qu_une_paire(fournisseur, strict):
     """Les deux requetes passent `load_refresh_token` avant que l'une n'echange :
     la rotation atomique n'en laisse aboutir qu'une."""
     premier = fournisseur._emettre("client-a", ["mcp:lecture"], None)
@@ -175,7 +181,24 @@ def test_configuration_invalide_retombe_sur_les_defauts(monkeypatch):
     monkeypatch.setenv("VAULT_MCP_OAUTH_REFRESH_REUSE_GRACE_S", "86400")
     assert oauth.duree_rafraichissement_s() == 30 * JOUR
     assert oauth.duree_max_famille_s() == 90 * JOUR
+    assert oauth.grace_rejeu_s() == 60
+
+
+def test_grace_par_defaut_60_s_et_strict_configurable(monkeypatch):
+    assert oauth.grace_rejeu_s() == 60
+    monkeypatch.setenv("VAULT_MCP_OAUTH_REFRESH_REUSE_GRACE_S", "0")
     assert oauth.grace_rejeu_s() == 0
+
+
+async def test_grace_par_defaut_tolere_le_retry_puis_detecte(fournisseur, monkeypatch):
+    """Sans configuration : retry immediat tolere (ChatGPT), rejeu a +61 s revoque."""
+    premier = fournisseur._emettre("client-a", ["mcp:lecture"], None)
+    second = await _rafraichir(fournisseur, premier.refresh_token)
+    assert await _rafraichir(fournisseur, premier.refresh_token) is not None
+    reel = time.time
+    monkeypatch.setattr(oauth.time, "time", lambda: reel() + 61)
+    assert await _rafraichir(fournisseur, premier.refresh_token) is None
+    assert fournisseur.magasin.lire_rafraichissement(second.refresh_token) is None
 
 
 def test_duree_glissante_jamais_superieure_a_la_duree_absolue(monkeypatch):
@@ -194,7 +217,7 @@ def _poser_herite(magasin: MagasinOAuth, jeton: str, expire_a: int) -> None:
     )
 
 
-async def test_jeton_herite_reste_accepte_et_entre_dans_une_famille(fournisseur):
+async def test_jeton_herite_reste_accepte_et_entre_dans_une_famille(fournisseur, strict):
     _poser_herite(fournisseur.magasin, "herite-30j", int(time.time()) + 10 * JOUR)
     suite = await _rafraichir(fournisseur, "herite-30j")
     assert suite is not None
@@ -233,7 +256,7 @@ def test_revocation_administrative_par_client(fournisseur):
     assert fournisseur.magasin.revoquer_client(None) == 2
 
 
-async def test_endpoints_token_et_revoke_du_sdk(fournisseur):
+async def test_endpoints_token_et_revoke_du_sdk(fournisseur, strict):
     """Bout en bout a travers les handlers reels du SDK : /token puis /revoke."""
     application = Starlette(
         routes=create_auth_routes(

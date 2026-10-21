@@ -92,10 +92,11 @@ DUREE_RAFRAICHISSEMENT_S = 30 * 24 * 3600
 # actif : une fuite ne vaut jamais persistance illimitee.
 DUREE_MAX_FAMILLE_S = 90 * 24 * 3600
 # Fenetre pendant laquelle un jeton de rafraichissement DEJA consomme reste
-# echangeable (requete rejouee apres une reponse perdue). 0 = rotation stricte :
-# tout rejeu revoque la famille entiere. Plafonnee : une grace longue annulerait
-# la detection de vol.
-GRACE_REJEU_DEFAUT_S = 0
+# echangeable (requete rejouee apres une reponse perdue). Defaut 60 s : un client
+# (ChatGPT) qui rejoue son refresh apres une reponse perdue ne perd pas sa session.
+# 0 = rotation stricte : tout rejeu revoque la famille entiere. Plafonnee : une
+# grace longue annulerait la detection de vol.
+GRACE_REJEU_DEFAUT_S = 60
 GRACE_REJEU_MAX_S = 300
 # Au-dela, une demande de consentement laissee ouverte est abandonnee.
 DUREE_DEMANDE_S = 600
@@ -136,7 +137,7 @@ def duree_rafraichissement_s() -> int:
 
 
 def grace_rejeu_s() -> int:
-    """`VAULT_MCP_OAUTH_REFRESH_REUSE_GRACE_S`, defaut 0 (strict), maximum 300 s."""
+    """`VAULT_MCP_OAUTH_REFRESH_REUSE_GRACE_S`, defaut 60 s, 0 = strict, maximum 300 s."""
     return _duree_env(
         "VAULT_MCP_OAUTH_REFRESH_REUSE_GRACE_S", GRACE_REJEU_DEFAUT_S, 0, GRACE_REJEU_MAX_S
     )
