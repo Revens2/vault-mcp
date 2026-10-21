@@ -427,13 +427,18 @@ class MagasinOAuth:
 
     @staticmethod
     def _retirer_famille(etat: dict[str, dict[str, Any]], famille: str) -> int:
-        """Retire tous les jetons vivants (acces + rafraichissement) d'une famille."""
+        """Retire tous les jetons vivants (acces + rafraichissement) d'une famille et
+        marque ses jetons consommes `revoque` : sans ce marqueur, un refresh consomme
+        dans la fenetre de grace ressusciterait la famille revoquee."""
         retires = 0
         for cle in ("acces", "rafraichissements"):
             vivants = etat[cle]
             for jeton in [j for j, d in vivants.items() if d.get("famille") == famille]:
                 del vivants[jeton]
                 retires += 1
+        for marque in etat["consommes"].values():
+            if marque.get("famille") == famille:
+                marque["revoque"] = True
         return retires
 
     def tourner(
@@ -510,9 +515,6 @@ class MagasinOAuth:
             if _dans_la_grace(consomme, grace_s):
                 return "grace"
             retires = self._retirer_famille(etat, consomme["famille"])
-            for marque in etat["consommes"].values():
-                if marque.get("famille") == consomme["famille"]:
-                    marque["revoque"] = True
             _journal.warning(
                 "OAuth: rejeu d'un jeton de rafraichissement consomme, famille revoquee "
                 "(client=%s famille=%s jetons_retires=%d)",
@@ -533,7 +535,13 @@ class MagasinOAuth:
         seul ce jeton est retire."""
 
         def _revoquer(etat: dict[str, dict[str, Any]]) -> int:
-            donnees = etat["acces"].get(jeton) or etat["rafraichissements"].get(jeton)
+            donnees = (
+                etat["acces"].get(jeton)
+                or etat["rafraichissements"].get(jeton)
+                # Refresh deja tourne : sa famille doit tomber aussi (sinon la grace
+                # le laisserait encore s'echanger).
+                or etat["consommes"].get(_empreinte(jeton))
+            )
             if donnees is None:
                 return 0
             famille = donnees.get("famille")
@@ -562,6 +570,10 @@ class MagasinOAuth:
                 for jeton in cibles:
                     del vivants[jeton]
                     retires += 1
+            # Ferme aussi la fenetre de grace des refresh deja consommes.
+            for marque in etat["consommes"].values():
+                if client_id is None or marque.get("client_id") == client_id:
+                    marque["revoque"] = True
             return retires
 
         return int(self._modifier_etat(_revoquer))

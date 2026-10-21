@@ -246,6 +246,33 @@ async def test_revoke_token_revoque_la_famille(fournisseur):
     assert fournisseur.magasin.lire_rafraichissement(paire.refresh_token) is None
 
 
+async def test_revoke_ferme_la_grace_des_refresh_consommes(fournisseur):
+    """Rotation, /revoke du refresh courant, puis rejeu de l'ancien DANS la grace :
+    la famille revoquee ne doit pas ressusciter."""
+    premier = fournisseur._emettre("client-a", ["mcp:lecture"], None)
+    second = await _rafraichir(fournisseur, premier.refresh_token)
+    charge = await fournisseur.load_refresh_token(_client(), second.refresh_token)
+    await fournisseur.revoke_token(charge)
+    assert await _rafraichir(fournisseur, premier.refresh_token) is None
+
+
+async def test_revoke_d_un_refresh_consomme_revoque_sa_famille(fournisseur):
+    premier = fournisseur._emettre("client-a", ["mcp:lecture"], None)
+    second = await _rafraichir(fournisseur, premier.refresh_token)
+    assert fournisseur.magasin.revoquer_famille_du_jeton(premier.refresh_token) > 0
+    assert fournisseur.magasin.lire_rafraichissement(second.refresh_token) is None
+    assert await fournisseur.load_access_token(second.access_token) is None
+    assert await fournisseur.load_access_token(premier.access_token) is None
+    assert await _rafraichir(fournisseur, premier.refresh_token) is None
+
+
+async def test_revocation_admin_ferme_la_grace(fournisseur):
+    premier = fournisseur._emettre("client-a", ["mcp:lecture"], None)
+    await _rafraichir(fournisseur, premier.refresh_token)
+    fournisseur.magasin.revoquer_client("client-a")
+    assert await _rafraichir(fournisseur, premier.refresh_token) is None
+
+
 def test_revocation_administrative_par_client(fournisseur):
     a = fournisseur._emettre("client-a", ["mcp:lecture"], None)
     b = fournisseur._emettre("client-b", ["mcp:lecture"], None)
