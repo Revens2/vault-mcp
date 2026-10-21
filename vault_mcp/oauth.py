@@ -150,8 +150,17 @@ def _empreinte(jeton: str) -> str:
 
 
 def _dans_la_grace(consomme: dict[str, Any], grace_s: int) -> bool:
-    """Grace 0 = aucune tolerance, meme dans la seconde du premier echange."""
-    if grace_s <= 0 or consomme.get("revoque"):
+    """Grace 0 = aucune tolerance, meme dans la seconde du premier echange.
+
+    La grace ne sert qu'UNE fois par jeton (`grace_utilisee`) et ne couvre jamais
+    un successeur remplace (`remplace`) : sans cela, des rejeux successifs dans la
+    fenetre multiplieraient les refresh valides d'une meme famille."""
+    if (
+        grace_s <= 0
+        or consomme.get("revoque")
+        or consomme.get("grace_utilisee")
+        or consomme.get("remplace")
+    ):
         return False
     return int(time.time()) - int(consomme.get("consomme_a", 0)) <= grace_s
 
@@ -452,8 +461,11 @@ class MagasinOAuth:
 
         - jeton vivant : il passe en `consommes` (par empreinte) puis
           `emettre(base)` pose la paire suivante dans la meme famille ;
-        - jeton consomme depuis <= `grace_s` : nouvelle paire, famille conservee
-          (reponse perdue puis requete rejouee par le client) ;
+        - jeton consomme depuis <= `grace_s`, UNE seule fois : la paire emise lors
+          de la consommation (jamais recue : reponse perdue) est REMPLACEE par une
+          nouvelle, famille conservee. Le successeur remplace passe en `consommes`
+          marque `remplace` : s'il est presente plus tard, c'est un rejeu et la
+          famille tombe. Une famille n'a donc jamais deux refresh vivants ;
         - sinon : None. Deux echanges concurrents du meme jeton ne produisent donc
           jamais deux paires hors grace.
 
@@ -464,38 +476,81 @@ class MagasinOAuth:
             maintenant = int(time.time())
             empreinte = _empreinte(ancien)
             base = etat["rafraichissements"].get(ancien)
-            if base is not None and base.get("client_id") == client_id:
-                del etat["rafraichissements"][ancien]
-                famille = base.get("famille") or secrets.token_urlsafe(16)
-                famille_expire_a = base.get("famille_expire_a") or (
-                    maintenant + duree_max_famille_s()
-                )
-                base = {**base, "famille": famille, "famille_expire_a": famille_expire_a}
-                etat["consommes"][empreinte] = {
-                    "client_id": client_id,
-                    "scopes": base["scopes"],
-                    "famille": famille,
-                    "famille_expire_a": famille_expire_a,
-                    "consomme_a": maintenant,
-                    # Conserve tant que le jeton aurait ete valide : au-dela, un rejeu
-                    # serait de toute facon refuse comme expire.
-                    "expire_a": base.get("expire_a", maintenant),
-                }
-            else:
+            if base is None or base.get("client_id") != client_id:
                 consomme = etat["consommes"].get(empreinte)
                 if (
                     consomme is None
                     or consomme.get("client_id") != client_id
                     or not _dans_la_grace(consomme, grace_s)
+                    or consomme["famille_expire_a"] <= maintenant
+                    or not self._remplacer_successeur(etat, consomme, maintenant)
                 ):
                     return None
-                base = consomme
+                consomme["grace_utilisee"] = True
+                resultat = emettre(consomme, etat)
+                consomme["successeur"] = _empreinte(resultat.refresh_token or "")
+                consomme["successeur_acces"] = _empreinte(resultat.access_token)
+                return resultat
+            del etat["rafraichissements"][ancien]
+            famille = base.get("famille") or secrets.token_urlsafe(16)
+            famille_expire_a = base.get("famille_expire_a") or (
+                maintenant + duree_max_famille_s()
+            )
+            base = {**base, "famille": famille, "famille_expire_a": famille_expire_a}
+            etat["consommes"][empreinte] = {
+                "client_id": client_id,
+                "scopes": base["scopes"],
+                "famille": famille,
+                "famille_expire_a": famille_expire_a,
+                "consomme_a": maintenant,
+                # Conserve tant que le jeton aurait ete valide : au-dela, un rejeu
+                # serait de toute facon refuse comme expire.
+                "expire_a": base.get("expire_a", maintenant),
+            }
             if base["famille_expire_a"] <= maintenant:
                 return None
-            return emettre(base, etat)
+            resultat = emettre(base, etat)
+            etat["consommes"][empreinte]["successeur"] = _empreinte(resultat.refresh_token or "")
+            etat["consommes"][empreinte]["successeur_acces"] = _empreinte(resultat.access_token)
+            return resultat
 
         resultat: OAuthToken | None = self._modifier_etat(_tourner)
         return resultat
+
+    @staticmethod
+    def _remplacer_successeur(
+        etat: dict[str, dict[str, Any]], consomme: dict[str, Any], maintenant: int
+    ) -> bool:
+        """Retire la paire emise lors de la consommation de `consomme` et garde son
+        refresh en `consommes` marque `remplace` (sa presentation ulterieure = rejeu).
+
+        False si le successeur n'est plus vivant (deja tourne, revoque, ou entree sans
+        successeur connu) : la grace n'a alors plus d'objet, le rejeu est refuse."""
+        successeur = consomme.get("successeur")
+        vivant = next(
+            (
+                j
+                for j in etat["rafraichissements"]
+                if successeur and _empreinte(j) == successeur
+            ),
+            None,
+        )
+        if vivant is None:
+            return False
+        donnees = etat["rafraichissements"].pop(vivant)
+        etat["consommes"][successeur] = {
+            "client_id": donnees["client_id"],
+            "scopes": donnees["scopes"],
+            "famille": donnees["famille"],
+            "famille_expire_a": donnees["famille_expire_a"],
+            "consomme_a": maintenant,
+            "expire_a": donnees.get("expire_a", maintenant),
+            "remplace": True,
+        }
+        acces = consomme.get("successeur_acces")
+        for jeton in [j for j in etat["acces"] if acces and _empreinte(j) == acces]:
+            etat["acces"].pop(jeton)
+        return True
 
     def signaler_rejeu(self, jeton: str, client_id: str, grace_s: int) -> str:
         """Classe un jeton de rafraichissement absent des jetons vivants.

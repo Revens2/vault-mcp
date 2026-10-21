@@ -138,9 +138,45 @@ async def test_grace_tolere_un_rejeu_immediat(fournisseur, monkeypatch):
     # Reponse perdue : le client rejoue immediatement l'ancien refresh.
     troisieme = await _rafraichir(fournisseur, premier.refresh_token)
     assert troisieme is not None
-    assert fournisseur.magasin.lire_rafraichissement(second.refresh_token) is not None
+    # La paire jamais recue est remplacee : un seul refresh vivant par famille.
+    assert fournisseur.magasin.lire_rafraichissement(second.refresh_token) is None
+    assert await fournisseur.load_access_token(second.access_token) is None
     famille = fournisseur.magasin.lire_rafraichissement(troisieme.refresh_token)["famille"]
-    assert famille == fournisseur.magasin.lire_rafraichissement(second.refresh_token)["famille"]
+    vivants = fournisseur.magasin._etat()["rafraichissements"].values()
+    assert sum(1 for d in vivants if d.get("famille") == famille) == 1
+
+
+async def test_grace_ne_sert_qu_une_fois(fournisseur, monkeypatch):
+    """Rejeux successifs dans la fenetre : le second est un rejeu -> famille revoquee."""
+    monkeypatch.setenv("VAULT_MCP_OAUTH_REFRESH_REUSE_GRACE_S", "30")
+    premier = fournisseur._emettre("client-a", ["mcp:lecture"], None)
+    await _rafraichir(fournisseur, premier.refresh_token)
+    troisieme = await _rafraichir(fournisseur, premier.refresh_token)
+    assert await _rafraichir(fournisseur, premier.refresh_token) is None
+    assert fournisseur.magasin.lire_rafraichissement(troisieme.refresh_token) is None
+    assert await fournisseur.load_access_token(troisieme.access_token) is None
+
+
+async def test_successeur_remplace_presente_ensuite_revoque_la_famille(fournisseur, monkeypatch):
+    """Attaquant rejoue T1 dans la grace avant le client legitime : quand celui-ci
+    presente T2 (remplace), le rejeu est detecte et la famille de l'attaquant tombe."""
+    monkeypatch.setenv("VAULT_MCP_OAUTH_REFRESH_REUSE_GRACE_S", "30")
+    premier = fournisseur._emettre("client-a", ["mcp:lecture"], None)
+    legitime = await _rafraichir(fournisseur, premier.refresh_token)
+    attaquant = await _rafraichir(fournisseur, premier.refresh_token)
+    assert await _rafraichir(fournisseur, legitime.refresh_token) is None
+    assert fournisseur.magasin.lire_rafraichissement(attaquant.refresh_token) is None
+
+
+async def test_grace_refusee_si_le_successeur_a_deja_tourne(fournisseur, monkeypatch):
+    monkeypatch.setenv("VAULT_MCP_OAUTH_REFRESH_REUSE_GRACE_S", "30")
+    premier = fournisseur._emettre("client-a", ["mcp:lecture"], None)
+    second = await _rafraichir(fournisseur, premier.refresh_token)
+    troisieme = await _rafraichir(fournisseur, second.refresh_token)
+    with pytest.raises(TokenError) as erreur:
+        await _rafraichir(fournisseur, premier.refresh_token)
+    assert erreur.value.error == "invalid_grant"
+    assert fournisseur.magasin.lire_rafraichissement(troisieme.refresh_token) is not None
 
 
 async def test_rejeu_apres_la_grace_revoque(fournisseur, monkeypatch):
