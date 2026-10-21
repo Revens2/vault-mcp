@@ -41,6 +41,10 @@ SPOOL_DEFAUT = "/srv/vault-spool"
 # une montee de version cote MCP sans montee cote pousseur doit echouer bruyamment
 # en `failed/`, pas etre appliquee de travers.
 VERSION_SCHEMA = 1
+# Retention de done/ et failed/ : purge par vault_spool_push.sh
+# (RETENTION_JOURS=14). Les compteurs derives de ces dossiers sont donc
+# une FENETRE GLISSANTE de 14 j, jamais un cumul (issue #6).
+RETENTION_JOURS = 14
 
 OPS = (
     "create",
@@ -202,8 +206,9 @@ class Spool:
     def statistiques(self) -> dict[str, Any]:
         """Profondeur de file, ages, volume des echecs.
 
-        `echecs` reste le TOTAL historique (compat). La sante COURANTE se lit
-        dans `echecs_recents` (fenetre 1 h — une panne active produit de
+        `echecs`/`appliquees` : compat ; ce sont des fenetres glissantes de
+        RETENTION_JOURS (purge du pousseur), cf. `*_14j` (issue #6). La sante
+        COURANTE se lit dans `echecs_recents` (fenetre 1 h — une panne active produit de
         nouveaux receipts chaque cycle) et `echec_recent_s` (age du dernier
         echec) : un stock ancien de conflits CAS ne doit pas ressembler a une
         panne active.
@@ -237,6 +242,14 @@ class Spool:
             "echecs_recents": echecs_recents,
             "echec_recent_s": echec_recent_s,
             "appliquees": len(list(self.done.glob("*.json"))),
+            # Libelles explicites (issue #6) : `appliquees`/`echecs` gardes pour
+            # compat, mais ce sont des fenetres de RETENTION_JOURS, pas des cumuls.
+            "appliquees_14j": len(list(self.done.glob("*.json"))),
+            "echecs_14j": len(list(self.failed.glob("*.json"))),
+            "fenetre_retention_j": RETENTION_JOURS,
+            "note_compteurs": (
+                "appliquees/echecs = fenetre glissante 14 j (purge done/ failed/), pas un cumul"
+            ),
         }
 
 
