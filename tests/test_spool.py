@@ -18,7 +18,7 @@ from typing import Any
 
 import pytest
 
-from vault_mcp.spool import Spool, SpoolError
+from vault_mcp.spool import RETENTION_JOURS, Spool, SpoolError
 
 
 @pytest.fixture
@@ -203,6 +203,18 @@ def test_statistiques(spool: Spool) -> None:
     assert stats["echecs"] == 1
     assert stats["appliquees"] == 0
     assert stats["plus_vieux_s"] is not None
+
+
+def test_statistiques_compteurs_fenetre_14j(spool: Spool) -> None:
+    """Les compteurs derives de done/ et failed/ sont une fenetre de retention,
+    libellee explicitement (vps-etude-infra#6)."""
+    (spool.done / "0123456789ab.json").write_text("{}", encoding="utf-8")
+    (spool.failed / "ba9876543210.json").write_text("{}", encoding="utf-8")
+    stats = spool.statistiques()
+    assert stats["appliquees_14j"] == stats["appliquees"] == 1
+    assert stats["echecs_14j"] == stats["echecs"] == 1
+    assert stats["fenetre_retention_j"] == RETENTION_JOURS == 14
+    assert "14 j" in stats["note_compteurs"]
 
 
 def test_statistiques_sans_spool(tmp_path: Path) -> None:
