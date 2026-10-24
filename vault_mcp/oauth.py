@@ -289,6 +289,33 @@ def _lire(cible: Path, defaut: Any) -> Any:
 # C'est ce qui permet de reconnaitre un rejeu (et donc un vol probable) au lieu de
 # le confondre avec un jeton inconnu.
 CATEGORIES_ETAT = ("demandes", "codes", "acces", "rafraichissements", "consommes")
+# Jetons VIVANTS indexes par empreinte SHA-256 (issue #14) : un vol de etat.json ne
+# livre aucun jeton utilisable. SHA-256 sans sel suffit : jetons de 256 bits d'entropie
+# (`secrets.token_urlsafe(32)`), aucune attaque par dictionnaire possible.
+CATEGORIES_VIVANTES = ("acces", "rafraichissements")
+
+
+def _est_empreinte(cle: str) -> bool:
+    """Une cle d'etat deja hachee : 64 caracteres hexadecimaux minuscules. Un jeton
+    `token_urlsafe(32)` fait 43 caracteres et ne peut donc pas etre confondu."""
+    return len(cle) == 64 and all(c in "0123456789abcdef" for c in cle)
+
+
+def _migrer_vivants(etat: dict[str, dict[str, Any]]) -> int:
+    """Reindexe par empreinte les jetons vivants herites stockes en clair (cle = jeton,
+    champ `jeton`). Idempotent ; retourne le nombre d'entrees migrees. Sans perte :
+    aucun re-consentement, le client presente le meme jeton et l'empreinte le retrouve.
+    """
+    migres = 0
+    for cle in CATEGORIES_VIVANTES:
+        vivants = etat.setdefault(cle, {})
+        for jeton in [j for j, d in vivants.items() if "jeton" in d or not _est_empreinte(j)]:
+            donnees = vivants.pop(jeton)
+            donnees.pop("jeton", None)
+            # Ne jamais ecraser une entree deja hachee (cas impossible en pratique).
+            vivants.setdefault(_empreinte(jeton), donnees)
+            migres += 1
+    return migres
 
 
 class MagasinOAuth:
@@ -341,17 +368,27 @@ class MagasinOAuth:
 
     # --- etat ------------------------------------------------------------------------
     def _etat(self) -> dict[str, dict[str, Any]]:
+        """Etat en lecture seule. Un etat herite en clair est reindexe EN MEMOIRE
+        (lecture retro-compatible) ; la reecriture hachee a lieu a la prochaine
+        ecriture (`_modifier_etat`) ou via `migrer_etat()`."""
         etat: dict[str, dict[str, Any]] = _lire(self._fichier_etat, {})
         for cle in CATEGORIES_ETAT:
             etat.setdefault(cle, {})
+        _migrer_vivants(etat)
         return etat
 
     def _modifier_etat(self, modification) -> Any:
-        """Read-modify-write de l'etat.json sous verrou, purge des expires incluse."""
+        """Read-modify-write de l'etat.json sous verrou, purge des expires incluse.
+
+        Migre au passage les jetons vivants herites en clair (issue #14) : la premiere
+        ecriture d'etat suffit a ne plus laisser aucun jeton en clair sur disque."""
 
         def _corps(etat: dict[str, dict[str, Any]]) -> Any:
             for cle in CATEGORIES_ETAT:
                 etat.setdefault(cle, {})
+            migres = _migrer_vivants(etat)
+            if migres:
+                _journal.info("OAuth: %d jeton(s) vivant(s) reindexe(s) par empreinte", migres)
             resultat = modification(etat)
             self._purger(etat)
             return resultat
@@ -411,26 +448,48 @@ class MagasinOAuth:
     def retirer_code(self, code: str) -> None:
         self._modifier_etat(lambda etat: etat["codes"].pop(code, None))
 
+    def migrer_etat(self) -> int:
+        """Force la reecriture hachee d'un etat herite ; retourne le nombre de jetons
+        migres (0 si deja hache). Idempotent, sans re-consentement."""
+        def _migrer(etat: dict[str, dict[str, Any]]) -> int:
+            for cle in CATEGORIES_ETAT:
+                etat.setdefault(cle, {})
+            migres = _migrer_vivants(etat)
+            self._purger(etat)
+            return migres
+
+        return int(_modifier(self._fichier_etat, {}, _migrer))
+
+    @staticmethod
+    def poser_vivant(etat: dict[str, dict[str, Any]], cle: str, donnees: dict[str, Any]) -> None:
+        """Pose un jeton vivant sous son empreinte ; le jeton lui-meme n'est jamais
+        persiste (champ `jeton` retire)."""
+        donnees = dict(donnees)
+        jeton = donnees.pop("jeton")
+        etat[cle][_empreinte(jeton)] = donnees
+
     def poser_jetons(self, acces: dict[str, Any], rafraichissement: dict[str, Any]) -> None:
         def _poser(etat: dict[str, dict[str, Any]]) -> None:
-            etat["acces"][acces["jeton"]] = acces
-            etat["rafraichissements"][rafraichissement["jeton"]] = rafraichissement
+            self.poser_vivant(etat, "acces", acces)
+            self.poser_vivant(etat, "rafraichissements", rafraichissement)
 
         self._modifier_etat(_poser)
 
     def lire_acces(self, jeton: str) -> dict[str, Any] | None:
-        donnees = self._etat()["acces"].get(jeton)
+        donnees = self._etat()["acces"].get(_empreinte(jeton))
         if donnees and donnees.get("expire_a", 0) <= int(time.time()):
             return None
         return donnees
 
     def lire_rafraichissement(self, jeton: str) -> dict[str, Any] | None:
-        return self._etat()["rafraichissements"].get(jeton)
+        return self._etat()["rafraichissements"].get(_empreinte(jeton))
 
     def revoquer(self, jeton: str) -> None:
+        empreinte = _empreinte(jeton)
+
         def _revoquer(etat: dict[str, dict[str, Any]]) -> None:
-            etat["acces"].pop(jeton, None)
-            etat["rafraichissements"].pop(jeton, None)
+            etat["acces"].pop(empreinte, None)
+            etat["rafraichissements"].pop(empreinte, None)
 
         self._modifier_etat(_revoquer)
 
@@ -475,7 +534,7 @@ class MagasinOAuth:
         def _tourner(etat: dict[str, dict[str, Any]]) -> OAuthToken | None:
             maintenant = int(time.time())
             empreinte = _empreinte(ancien)
-            base = etat["rafraichissements"].get(ancien)
+            base = etat["rafraichissements"].get(empreinte)
             if base is None or base.get("client_id") != client_id:
                 consomme = etat["consommes"].get(empreinte)
                 if (
@@ -491,7 +550,7 @@ class MagasinOAuth:
                 consomme["successeur"] = _empreinte(resultat.refresh_token or "")
                 consomme["successeur_acces"] = _empreinte(resultat.access_token)
                 return resultat
-            del etat["rafraichissements"][ancien]
+            del etat["rafraichissements"][empreinte]
             famille = base.get("famille") or secrets.token_urlsafe(16)
             famille_expire_a = base.get("famille_expire_a") or (
                 maintenant + duree_max_famille_s()
@@ -527,17 +586,9 @@ class MagasinOAuth:
         False si le successeur n'est plus vivant (deja tourne, revoque, ou entree sans
         successeur connu) : la grace n'a alors plus d'objet, le rejeu est refuse."""
         successeur = consomme.get("successeur")
-        vivant = next(
-            (
-                j
-                for j in etat["rafraichissements"]
-                if successeur and _empreinte(j) == successeur
-            ),
-            None,
-        )
-        if vivant is None:
+        if not successeur or successeur not in etat["rafraichissements"]:
             return False
-        donnees = etat["rafraichissements"].pop(vivant)
+        donnees = etat["rafraichissements"].pop(successeur)
         etat["consommes"][successeur] = {
             "client_id": donnees["client_id"],
             "scopes": donnees["scopes"],
@@ -548,8 +599,8 @@ class MagasinOAuth:
             "remplace": True,
         }
         acces = consomme.get("successeur_acces")
-        for jeton in [j for j in etat["acces"] if acces and _empreinte(j) == acces]:
-            etat["acces"].pop(jeton)
+        if acces:
+            etat["acces"].pop(acces, None)
         return True
 
     def signaler_rejeu(self, jeton: str, client_id: str, grace_s: int) -> str:
@@ -589,20 +640,22 @@ class MagasinOAuth:
         rafraichissement issus du meme consentement). Jeton herite sans famille :
         seul ce jeton est retire."""
 
+        empreinte = _empreinte(jeton)
+
         def _revoquer(etat: dict[str, dict[str, Any]]) -> int:
             donnees = (
-                etat["acces"].get(jeton)
-                or etat["rafraichissements"].get(jeton)
+                etat["acces"].get(empreinte)
+                or etat["rafraichissements"].get(empreinte)
                 # Refresh deja tourne : sa famille doit tomber aussi (sinon la grace
                 # le laisserait encore s'echanger).
-                or etat["consommes"].get(_empreinte(jeton))
+                or etat["consommes"].get(empreinte)
             )
             if donnees is None:
                 return 0
             famille = donnees.get("famille")
             if not famille:
-                etat["acces"].pop(jeton, None)
-                etat["rafraichissements"].pop(jeton, None)
+                etat["acces"].pop(empreinte, None)
+                etat["rafraichissements"].pop(empreinte, None)
                 return 1
             return self._retirer_famille(etat, famille)
 
@@ -794,8 +847,8 @@ class FournisseurOAuth(
                 base["famille"],
                 base["famille_expire_a"],
             )
-            etat["acces"][acces["jeton"]] = acces
-            etat["rafraichissements"][rafraichissement["jeton"]] = rafraichissement
+            MagasinOAuth.poser_vivant(etat, "acces", acces)
+            MagasinOAuth.poser_vivant(etat, "rafraichissements", rafraichissement)
             return jeton
 
         resultat = self._magasin.tourner(
