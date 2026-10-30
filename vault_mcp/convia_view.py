@@ -115,6 +115,11 @@ class Projection:
     messages: list[tuple[str, str]] = field(default_factory=list)
     events: list[Event] = field(default_factory=list)
     stats: dict[str, int] = field(default_factory=dict)
+    # Comptage par outil de TOUS les appels vus, retenus ou non : le résumé d'en-tête
+    # dit à l'analyste ce qui a échoué sans qu'il ait à croire l'agent sur parole.
+    tool_calls: dict[str, int] = field(default_factory=dict)
+    tool_errors: dict[str, int] = field(default_factory=dict)
+    last_tool: tuple[str, bool] | None = None
 
 
 def _split_frontmatter(raw: str) -> tuple[str, str]:
@@ -144,11 +149,26 @@ def _truncate_trace(text: str) -> str:
     return out
 
 
+# Échecs que les marqueurs anglais ci-dessus ratent : shell Windows/PowerShell en
+# français, codes de sortie, refus réseau. Mesuré le 2026-10-29 sur des transcripts
+# OpenCode : « head n'est pas reconnu… », « Binary 'ls' not found on PATH » passaient
+# pour des succès et l'analyste ne voyait aucune erreur.
+_ERROR_RX = re.compile(
+    r"n[’']est pas reconnu|is not recognized as|not found on PATH|CommandNotFoundException"
+    r"|Access is denied|Accès refusé|\bintrouvable\b|Impossible de (?:trouver|charger|se connecter)"
+    r"|(?im:^\s*(?:error|erreur)\s*[:\[])"
+    r"|(?i:\bexit (?:code|status))[ :=]+[1-9]|returned non-zero exit status"
+    r"|Connection refused|\[31;1m"
+)
+
+
 def _is_error(summary: str, body: str) -> bool:
     if "**Erreur**" in body:
         return True
     result = body.split("**Résultat** :", 1)[-1] if "**Résultat** :" in body else ""
-    return any(marker in result for marker in _ERROR_MARKERS[1:])
+    if any(marker in result for marker in _ERROR_MARKERS[1:]):
+        return True
+    return bool(_ERROR_RX.search(result))
 
 
 def _tool_of(summary: str) -> str:
@@ -206,6 +226,10 @@ def project(raw: str) -> Projection:
             tool = _tool_of(summary)
             error = _is_error(summary, inner)
             low = tool.lower() in _LOW_SIGNAL_TOOLS
+            proj.tool_calls[tool] = proj.tool_calls.get(tool, 0) + 1
+            if error:
+                proj.tool_errors[tool] = proj.tool_errors.get(tool, 0) + 1
+            proj.last_tool = (tool, error)
             if error:
                 payload = inner.split("**Erreur** :", 1)[-1]
                 payload = payload.split("**Résultat** :", 1)[-1]
@@ -251,9 +275,58 @@ def project(raw: str) -> Projection:
     return proj
 
 
+MAX_SUMMARY_ERRORS = 6
+MAX_SUMMARY_LINE = 160
+
+
+def _first_line(text: str) -> str:
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    line = re.sub(r"\[\d+(?:;\d+)*m", "", line)  # couleurs ANSI dont l'ESC a été retiré
+    return line[:MAX_SUMMARY_LINE] + (" […]" if len(line) > MAX_SUMMARY_LINE else "")
+
+
+def render_tool_summary(proj: Projection) -> list[str]:
+    """En-tête factuel : appels, échecs par outil, reprises, issue du dernier appel.
+
+    Calculé par le code, pas par le modèle : c'est la seule partie de la projection qui
+    dit ce que les outils ont RÉELLEMENT renvoyé, et elle survit à toute troncature
+    puisqu'elle précède la conversation.
+    """
+    total = sum(proj.tool_calls.values())
+    if not total:
+        return []
+    failed = sum(proj.tool_errors.values())
+    resumed = sum(1 for e in proj.events if not e.is_error)
+    lines = [
+        "# Résumé des appels d'outils (calculé, non déclaratif)",
+        "",
+        f"- appels : {total} ; en échec : {failed} ; reprises réussies après échec : {resumed}",
+    ]
+    if proj.tool_errors:
+        per_tool = ", ".join(f"{t} ×{n}" for t, n in
+                             sorted(proj.tool_errors.items(), key=lambda kv: (-kv[1], kv[0])))
+        lines.append(f"- outils en échec : {per_tool}")
+        seen: set[str] = set()
+        for event in proj.events:
+            if not event.is_error:
+                continue
+            first = _first_line(event.detail)
+            if not first or first in seen:
+                continue
+            seen.add(first)
+            lines.append(f"- échec {event.tool} — {first}")
+            if len(seen) >= MAX_SUMMARY_ERRORS:
+                break
+    if proj.last_tool:
+        tool, error = proj.last_tool
+        lines.append(f"- dernier appel d'outil : {tool} — {'échec' if error else 'succès'}")
+    return lines + [""]
+
+
 def render(proj: Projection) -> str:
     """Le Markdown effectivement remis à la tâche d'analyse."""
     parts = [f"# Conversation — {proj.title}" if proj.title else "# Conversation", ""]
+    parts += render_tool_summary(proj)
     for role, text in proj.messages:
         parts.append(f"## {role}")
         parts.append("")
@@ -268,6 +341,128 @@ def render(proj: Projection) -> str:
             parts.append(f"- outil {event.tool} — {label} : {detail}")
         parts.append("")
     return redact("\n".join(parts).rstrip() + "\n")
+
+
+# ------------------------------------------------------------------ compactage
+# Une projection au-delà du budget d'un appel n'était jamais servie (claim : `size`) :
+# 253 conversations en file le 2026-10-29, précisément les plus longues, là où se
+# concentrent les difficultés. Plutôt qu'un map-reduce (N appels sur un quota gratuit),
+# une vue compactée en UN appel : l'intention (début), tous les prompts de la personne
+# (frictions, recadrages), l'issue (fin), et les faits techniques calculés. Chaque
+# morceau est un PRÉFIXE littéral d'un message : les preuves citées restent vérifiables
+# contre la projection complète.
+_EVENTS_HEADING = "# Technical events relevant to analysis"
+_ROLE_LINE = re.compile(r"^## (User|Assistant)$", re.M)
+COMPACT_FIRST_CHARS = 4000
+COMPACT_USER_CHARS = 600
+COMPACT_TAIL_SHARE = 0.45
+COMPACT_EVENTS_SHARE = 0.12
+
+
+def _split_view(view: str) -> tuple[str, list[tuple[str, str]], str]:
+    events = ""
+    if "\n" + _EVENTS_HEADING + "\n" in view:
+        view, events = view.split("\n" + _EVENTS_HEADING + "\n", 1)
+        events = _EVENTS_HEADING + "\n" + events
+    marks = list(_ROLE_LINE.finditer(view))
+    head = view[: marks[0].start()] if marks else view
+    messages = []
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(view)
+        messages.append((m.group(1), view[m.end():end].strip("\n")))
+    return head.rstrip() + "\n", messages, events.rstrip()
+
+
+def _cut(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n[… message tronqué pour tenir dans un appel …]"
+
+
+def _cut_lines(text: str, limit: int) -> str:
+    """Tête et queue d'une liste d'événements, coupées sur des fins de ligne."""
+    if len(text) <= limit:
+        return text
+    lines = text.splitlines()
+    half = limit // 2
+    head, size = [], 0
+    for line in lines:
+        if size + len(line) + 1 > half:
+            break
+        head.append(line)
+        size += len(line) + 1
+    tail, size = [], 0
+    for line in reversed(lines[len(head):]):
+        if size + len(line) + 1 > half:
+            break
+        tail.append(line)
+        size += len(line) + 1
+    tail.reverse()
+    return "\n".join(head + ["- [… événements intermédiaires omis …]"] + tail)
+
+
+def compact_view(view: str, budget: int) -> str:
+    """Vue ≤ `budget` caractères d'une projection trop longue ; identité sinon."""
+    if len(view) <= budget:
+        return view
+    head, messages, events = _split_view(view)
+    head = _cut(head, int(budget * 0.08))
+    events = _cut_lines(events, int(budget * COMPACT_EVENTS_SHARE)) if events else ""
+    room = budget - len(head) - len(events) - 600
+    keep: dict[int, str] = {}
+    # 1. intention : le premier échange
+    for i, (_role, text) in enumerate(messages[:2]):
+        keep[i] = _cut(text, COMPACT_FIRST_CHARS)
+    used = sum(len(t) for t in keep.values())
+    # 2. issue : la fin, messages entiers, en remontant
+    tail_room = int(room * COMPACT_TAIL_SHARE)
+    for i in range(len(messages) - 1, 1, -1):
+        text = messages[i][1]
+        if len(text) > tail_room:
+            if not any(j > 1 for j in keep):
+                keep[i] = _cut(text, max(500, tail_room))
+                used += len(keep[i])
+            break
+        keep[i] = text
+        tail_room -= len(text)
+        used += len(text)
+    # 3. frictions : les prompts de la personne entre les deux, échantillonnés si besoin
+    middle = [i for i, (role, _t) in enumerate(messages) if role == "User" and i not in keep]
+    mid_room = room - used
+    per = COMPACT_USER_CHARS + 40
+    if middle and mid_room > per:
+        step = max(1, -(-len(middle) * per // mid_room))
+        for i in middle[::step]:
+            keep[i] = _cut(messages[i][1], COMPACT_USER_CHARS)
+
+    def assemble(chosen: dict[int, str]) -> str:
+        parts = [head, f"[Vue compactée : {len(chosen)} messages sur {len(messages)} conservés,"
+                       " en entier ou tronqués ; projection complète de "
+                       f"{len(view)} caractères.]", ""]
+        gap = 0
+        for i, (role, _text) in enumerate(messages):
+            if i not in chosen:
+                gap += 1
+                continue
+            if gap:
+                parts += [f"[… {gap} message(s) omis …]", ""]
+                gap = 0
+            parts += [f"## {role}", "", chosen[i], ""]
+        if gap:
+            parts += [f"[… {gap} message(s) omis …]", ""]
+        if events:
+            parts += [events, ""]
+        return "\n".join(parts).rstrip() + "\n"
+
+    out = assemble(keep)
+    # Garde-fou : retirer d'abord les prompts intermédiaires, puis le plus ancien de la fin.
+    while len(out) > budget and len(keep) > 1:
+        victims = [i for i in keep if 1 < i < len(messages) - 1]
+        if not victims:
+            break
+        del keep[victims[len(victims) // 2]]
+        out = assemble(keep)
+    return out if len(out) <= budget else out[:budget]
 
 
 def project_markdown(raw: str) -> tuple[str, dict[str, int]]:
