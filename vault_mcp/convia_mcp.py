@@ -46,7 +46,7 @@ _SOURCE_FOLDER = {
     "agy-cli": "AGY-CLI", "agy-desktop": "AGY-Desktop",
     "codex": "Codex", "freebuff-cli": "Freebuff-CLI",
     "freebuff-desktop": "Freebuff-Desktop", "freebuff": "Freebuff",
-    "chatgpt-web": "ChatGPT-Web",
+    "chatgpt-web": "ChatGPT-Web", "opencode": "OpenCode",
 }
 
 
@@ -183,7 +183,12 @@ def analysis_path_for(source_path: str, source_agent: str, title: str) -> str:
     forcément sur le même fichier, donc la seconde est un refus de doublon et non
     une note fantôme de plus dans le Vault.
     """
-    folder = _SOURCE_FOLDER.get(source_agent, source_agent or "Autres")
+    # Le dossier source fait foi (`raw/assets/ConvIA/OpenCode/…`) : la valeur brute
+    # `source: opencode` du frontmatter, faute d'entrée dans la table, avait créé un
+    # dossier d'analyse `opencode` en minuscules à côté de la source `OpenCode`.
+    parent = Path(source_path).parent
+    from_source = parent.name if parent.parent.as_posix().rstrip("/") + "/" == NAMESPACE else ""
+    folder = _SOURCE_FOLDER.get(source_agent) or from_source or source_agent or "Autres"
     stem = Path(source_path).stem
     return f"{ANALYSIS_NAMESPACE}{folder}/{stem}__analyse.md"
 
